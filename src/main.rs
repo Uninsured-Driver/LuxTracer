@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::f32;
+use std::{f32, sync::Arc};
 
 use image::{Rgb, RgbImage};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -135,17 +135,17 @@ impl Camera {
         Ray::new(self.origin, p.sub(self.origin))
     }
 
-    /// Builds a perspective pinhole camera based on **focal length** and **sensor height** (both in millimeters).
+    /// Builds a perspective pinhole camera based on the physical properties of cameras, like **focal length**, **sensor width** and **sensor height** (both in millimeters).
     /// # Arguments
-    /// * `aspect` - Image aspect ratio (width / height).
     /// * `focal_length` - Lens focal length (in millimeters).
+    /// * `sensor_width` - Sensor width (in millimeters)
     /// * `sensor_height` - Sensor height (in millimeters).
     /// * `look_from` - Camera position from world origin.
     /// * `look_at` - Target that the camera is aimed at.
     /// * `vup` - Up direction ((0, 0, 1) would be Z-up)
     /// # Returns
     /// A new `Camera` positioned at `look_from` and aimed at `look_at`.
-    fn from_focal_sensor(
+    fn from_physical_camera(
         focal_length: f32,
         sensor_width: f32,
         sensor_height: f32,
@@ -159,12 +159,13 @@ impl Camera {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 struct HitInfo {
     p: Vec3,
     normal: Vec3,
     t: f32,
     front_face: bool,
+    material: Arc<dyn Material>,
 }
 
 impl HitInfo {
@@ -178,13 +179,14 @@ impl HitInfo {
         (normal, front_face)
     }
 
-    fn new(ray: &Ray, p: Vec3, outward_normal: Vec3, t: f32) -> Self {
+    fn new(ray: &Ray, p: Vec3, outward_normal: Vec3, t: f32, material: Arc<dyn Material>) -> Self {
         let (normal, front_face) = Self::set_face_normal(ray, outward_normal);
         Self {
             p,
             normal,
             t,
             front_face,
+            material,
         }
     }
 }
@@ -193,14 +195,40 @@ trait Hittable {
     fn hit(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitInfo>;
 }
 
+trait Material: Send + Sync {
+    fn albedo(&self) -> Vec3;
+}
+
+struct Lambert {
+    albedo: Vec3,
+}
+
+impl Lambert {
+    fn new(albedo: Vec3) -> Self {
+        Self { albedo }
+    }
+}
+
+impl Material for Lambert {
+    fn albedo(&self) -> Vec3 {
+        self.albedo
+    }
+}
+
+#[derive(Clone)]
 struct Sphere {
     center: Vec3,
     radius: f32,
+    material: Arc<dyn Material>,
 }
 
 impl Sphere {
-    fn new(center: Vec3, radius: f32) -> Self {
-        Self { center, radius }
+    fn new(center: Vec3, radius: f32, material: Arc<dyn Material>) -> Self {
+        Self {
+            center,
+            radius,
+            material,
+        }
     }
 }
 
@@ -237,6 +265,7 @@ impl Hittable for Sphere {
             normal,
             t,
             front_face,
+            material: Arc::clone(&self.material),
         })
     }
 }
@@ -306,6 +335,35 @@ impl AreaLight {
     }
 }
 
+struct HittableList {
+    objects: Vec<Box<dyn Hittable>>,
+}
+
+impl HittableList {
+    fn new() -> Self {
+        Self { objects: vec![] }
+    }
+
+    fn add<T: Hittable + 'static>(&mut self, object: T) {
+        self.objects.push(Box::new(object));
+    }
+}
+
+impl Hittable for HittableList {
+    fn hit(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitInfo> {
+        let mut closest = t_max;
+        let mut hit = None;
+
+        for o in &self.objects {
+            if let Some(h) = o.hit(ray, t_min, closest) {
+                closest = h.t;
+                hit = Some(h);
+            }
+        }
+        hit
+    }
+}
+
 fn visible_to_point(p: Vec3, y: Vec3, world: &dyn Hittable) -> bool {
     let eps = 1e-3;
     let v = y.sub(p);
@@ -315,7 +373,7 @@ fn visible_to_point(p: Vec3, y: Vec3, world: &dyn Hittable) -> bool {
     }
     let dir = v.norm();
     let shadow_ray = Ray::new(p.add(dir.smul(eps)), dir);
-    world.hit(&shadow_ray, 0.0, dist - eps).is_none()
+    world.hit(&shadow_ray, eps, (dist - eps).max(eps)).is_none()
 }
 
 fn lambert_direct_mc<R: Rng + ?Sized>(
@@ -366,33 +424,51 @@ fn lambert_direct_mc<R: Rng + ?Sized>(
 }
 
 fn linear_to_srgb(c: Vec3) -> [u8; 3] {
-    let clamp = |x: f32| x.clamp(0.0, 1.0);
-    let convert = |x: f32| (clamp(x).powf(1.0 / 2.2) * 255.0 + 0.5) as u8;
-    [convert(c.x), convert(c.y), convert(c.z)]
+    fn to8(x: f32) -> u8 {
+        let x = x.clamp(0.0, 1.0);
+
+        let s = if x <= 0.0031308 {
+            12.92 * x
+        } else {
+            1.055 * x.powf(1.0 / 2.4) - 0.055
+        };
+        (s * 255.0 + 0.5) as u8
+    }
+    [to8(c.x), to8(c.y), to8(c.z)]
 }
 
 fn main() {
     let width = 2160;
     let height = 1440;
 
-    let spp = 128;
+    let spp = 32;
 
-    let camera = Camera::from_focal_sensor(
-        50.0,
-        36.0,
-        24.0,
-        Vec3::new(0.0, -5.0, 0.0),
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(0.0, 0.0, 1.0),
+    let camera = Camera::from_physical_camera(
+        50.0,                       // Focal length
+        36.0,                       // Sensor width
+        24.0,                       // Sensor height
+        Vec3::new(0.0, -10.0, 0.0), // Look from
+        Vec3::new(0.0, 0.0, 0.0),   // Look At
+        Vec3::new(0.0, 0.0, 1.0),   // Up (0.0, 0.0, 1.0) for Z-up
     );
-    let sphere = Sphere::new(Vec3::new(0.0, 0.0, 0.0), 1.0);
+
+    let material1 = Lambert::new(Vec3::new(0.74, 0.1, 0.1));
+    let material2 = Lambert::new(Vec3::new(0.16, 0.4, 0.9));
+
+    let sphere1 = Sphere::new(Vec3::new(0.0, 0.0, 0.0), 1.0, Arc::new(material1));
+    let sphere2 = Sphere::new(Vec3::new(5.0, 0.0, 0.0), 3.0, Arc::new(material2));
+
     let area_light = AreaLight::new(
         Vec3::new(0.0, 0.0, 2.75),  // Position
         Vec3::new(0.0, 1.5, 0.0),   // Width
         Vec3::new(1.5, 0.0, 0.0),   // Height
-        Vec3::new(1.0, 0.85, 0.73), // Color
-        70.0,
+        Vec3::new(1.0, 0.85, 0.73), // Color ~4500k
+        70.0,                       // Powers
     );
+
+    let mut hl = HittableList::new();
+    hl.add(sphere1);
+    hl.add(sphere2);
 
     let pb = ProgressBar::new(width as u64 * height as u64);
     pb.set_style(
@@ -410,6 +486,7 @@ fn main() {
     for y in 0..height {
         for x in 0..width {
             let mut color = Vec3::new(0.0, 0.0, 0.0);
+
             for _ in 0..spp {
                 let jx = rng.random::<f32>();
                 let jy = rng.random::<f32>();
@@ -419,15 +496,15 @@ fn main() {
 
                 let ray = camera.get_ray(u, v);
 
-                let sample_color = if let Some(hit) = sphere.hit(&ray, 1e-3, f32::INFINITY) {
+                let sample_color = if let Some(hit) = hl.hit(&ray, 1e-3, f32::INFINITY) {
                     lambert_direct_mc(
                         hit.p,
                         hit.normal,
-                        Vec3::new(0.74, 0.1, 0.1),
+                        hit.material.albedo(),
                         &area_light,
-                        &sphere,
-                        3,
-                        3,
+                        &hl,
+                        2,
+                        2,
                         &mut rng,
                     )
                 } else {
@@ -442,6 +519,7 @@ fn main() {
         }
     }
     pb.finish();
+    println!();
 
     img.save("render.png").unwrap();
 }
