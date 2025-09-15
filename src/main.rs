@@ -423,7 +423,7 @@ fn main() {
                     lambert_direct_mc(
                         hit.p,
                         hit.normal,
-                        Vec3::new(0.9, 0.9, 0.9),
+                        Vec3::new(0.74, 0.1, 0.1),
                         &area_light,
                         &sphere,
                         3,
