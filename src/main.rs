@@ -1,6 +1,10 @@
 #![allow(dead_code)]
+#![allow(unused_variables)]
 
-use std::{f32, sync::Arc};
+use std::{
+    f32::{self, consts::PI},
+    sync::Arc,
+};
 
 use image::{Rgb, RgbImage};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -63,13 +67,6 @@ impl Vec3 {
     }
 
     // ---------- Utilities ----------
-    fn clamp01(self) -> Self {
-        Self::new(
-            self.x.clamp(0.0, 1.0),
-            self.y.clamp(0.0, 1.0),
-            self.z.clamp(0.0, 1.0),
-        )
-    }
     fn max_comp(self) -> f32 {
         self.x.max(self.y).max(self.z)
     }
@@ -103,7 +100,7 @@ struct Camera {
 }
 
 impl Camera {
-    /// Builds a new perspective pinhole camera
+    /// Builds a new perspective pinhole camera.
     fn new(aspect: f32, vfov: f32, look_from: Vec3, look_at: Vec3, vup: Vec3) -> Camera {
         let theta = vfov.to_radians();
         let h = (theta * 0.5).tan();
@@ -159,13 +156,17 @@ impl Camera {
     }
 }
 
+trait Hittable {
+    fn hit(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitInfo>;
+}
+
 #[derive(Clone)]
 struct HitInfo {
     p: Vec3,
     normal: Vec3,
     t: f32,
     front_face: bool,
-    material: Arc<dyn Material>,
+    material: Materials,
 }
 
 impl HitInfo {
@@ -179,7 +180,7 @@ impl HitInfo {
         (normal, front_face)
     }
 
-    fn new(ray: &Ray, p: Vec3, outward_normal: Vec3, t: f32, material: Arc<dyn Material>) -> Self {
+    fn new(ray: &Ray, p: Vec3, outward_normal: Vec3, t: f32, material: Materials) -> Self {
         let (normal, front_face) = Self::set_face_normal(ray, outward_normal);
         Self {
             p,
@@ -191,12 +192,19 @@ impl HitInfo {
     }
 }
 
-trait Hittable {
-    fn hit(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitInfo>;
+#[derive(Clone)]
+enum Materials {
+    Reflective(Arc<dyn Reflective>),
+    Emissive(Arc<dyn Emissive>),
 }
 
-trait Material: Send + Sync {
-    fn albedo(&self) -> Vec3;
+trait Reflective: Send + Sync {
+    fn eval_brdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> Vec3;
+    fn sample_brdf(&self, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3);
+}
+
+trait Emissive: Send + Sync {
+    fn emission(&self, wo: Vec3, n: Vec3) -> Vec3;
 }
 
 struct Lambert {
@@ -209,9 +217,46 @@ impl Lambert {
     }
 }
 
-impl Material for Lambert {
-    fn albedo(&self) -> Vec3 {
-        self.albedo
+impl Reflective for Lambert {
+    fn eval_brdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> Vec3 {
+        self.albedo.smul(1.0 / PI)
+    }
+
+    fn sample_brdf(&self, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3) {
+        let (sample, pdf) = cosine_weighted_sampling(rng);
+        let (t, b) = build_onb(n);
+        let wi = local_to_world(sample, t, b, n);
+
+        let brdf = self.albedo.smul(1.0 / PI);
+
+        (wi, pdf, brdf)
+    }
+}
+
+struct DiffuseEmitter {
+    radiance: Vec3,
+}
+
+impl DiffuseEmitter {
+    fn new(radiance: Vec3) -> Self {
+        Self { radiance }
+    }
+
+    fn from_power(color: Vec3, power: f32, area: f32) -> Self {
+        let scale = power / (area.max(1e-8) * PI);
+        Self {
+            radiance: color.smul(scale),
+        }
+    }
+}
+
+impl Emissive for DiffuseEmitter {
+    fn emission(&self, wo: Vec3, n: Vec3) -> Vec3 {
+        if n.dot(&wo) > 0.0 {
+            self.radiance
+        } else {
+            Vec3::zero()
+        }
     }
 }
 
@@ -219,11 +264,11 @@ impl Material for Lambert {
 struct Sphere {
     center: Vec3,
     radius: f32,
-    material: Arc<dyn Material>,
+    material: Materials,
 }
 
 impl Sphere {
-    fn new(center: Vec3, radius: f32, material: Arc<dyn Material>) -> Self {
+    fn new(center: Vec3, radius: f32, material: Materials) -> Self {
         Self {
             center,
             radius,
@@ -234,8 +279,6 @@ impl Sphere {
 
 impl Hittable for Sphere {
     fn hit(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitInfo> {
-        // This is pure magic copied from ChatGPT
-        // I have no idea how this works or why
         let oc = ray.origin.sub(self.center);
 
         let a = ray.dir.dot(&ray.dir);
@@ -265,7 +308,83 @@ impl Hittable for Sphere {
             normal,
             t,
             front_face,
-            material: Arc::clone(&self.material),
+            material: self.material.clone(),
+        })
+    }
+}
+
+struct Quad {
+    center: Vec3,
+    ux: Vec3,
+    vy: Vec3,
+    material: Materials,
+}
+
+impl Quad {
+    fn new(center: Vec3, ux: Vec3, vy: Vec3, material: Materials) -> Self {
+        Self {
+            center,
+            ux,
+            vy,
+            material,
+        }
+    }
+
+    fn area(&self) -> f32 {
+        self.ux.cross(self.vy).length() * 4.0
+    }
+}
+
+impl Hittable for Quad {
+    fn hit(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitInfo> {
+        let n = self.ux.cross(self.vy);
+        if n.length() < 1e-3 {
+            return None;
+        }
+        let n_norm = n.norm();
+
+        let denom = n_norm.dot(&ray.dir);
+        if denom.abs() < 1e-3 {
+            return None;
+        }
+
+        let oc = self.center.sub(ray.origin);
+        let t = n_norm.dot(&oc) / denom;
+        if t < t_min || t > t_max {
+            return None;
+        }
+
+        let p = ray.at(t);
+        let r = p.sub(self.center);
+
+        let m00 = self.ux.dot(&self.ux);
+        let m01 = self.ux.dot(&self.vy);
+        let m11 = self.vy.dot(&self.vy);
+        let rhs0 = self.ux.dot(&r);
+        let rhs1 = self.vy.dot(&r);
+
+        let det = m00 * m11 - m01 * m01;
+        if det.abs() < 1e-3 {
+            return None;
+        }
+
+        let inv_det = 1.0 / det;
+        let a = (rhs0 * m11 - rhs1 * m01) * inv_det;
+        let b = (rhs1 * m00 - rhs0 * m01) * inv_det;
+
+        let padding = 1.0 + 1e-3;
+        if a < -padding || a > padding || b < -padding || b > padding {
+            return None;
+        }
+
+        let (normal, front_face) = HitInfo::set_face_normal(ray, n_norm);
+
+        Some(HitInfo {
+            p,
+            normal,
+            t,
+            front_face,
+            material: self.material.clone(),
         })
     }
 }
@@ -330,7 +449,7 @@ impl AreaLight {
     }
 
     fn emission(&self) -> Vec3 {
-        let scale = self.power / (self.area().max(1e-8) * f32::consts::PI);
+        let scale = self.power / (self.area().max(1e-8) * PI);
         self.color.smul(scale)
     }
 }
@@ -411,7 +530,7 @@ fn lambert_direct_mc<R: Rng + ?Sized>(
                 continue;
             }
 
-            let brdf = albedo.smul(1.0 / f32::consts::PI);
+            let brdf = albedo.smul(1.0 / PI);
             let geom = (cos_i * cos_l) / r2;
             let contribution = emission.mul(brdf).smul(geom / p_a);
 
@@ -421,6 +540,100 @@ fn lambert_direct_mc<R: Rng + ?Sized>(
 
     let total = (m * n) as f32;
     sum.smul(1.0 / total)
+}
+
+fn local_to_world(local: Vec3, t: Vec3, b: Vec3, n: Vec3) -> Vec3 {
+    t.smul(local.x).add(b.smul(local.y)).add(n.smul(local.z))
+}
+
+fn cosine_weighted_sampling<R: Rng + ?Sized>(rng: &mut R) -> (Vec3, f32) {
+    let u1 = rng.random::<f32>();
+    let u2 = rng.random::<f32>();
+
+    let r = u1.sqrt();
+    let phi = 2.0 * PI * u2;
+
+    let x = r * phi.cos();
+    let y = r * phi.sin();
+    let z = (1.0 - u1).max(0.0).sqrt();
+
+    let pdf = (z / PI).max(1e-8);
+    (Vec3::new(x, y, z), pdf)
+}
+
+// From https://graphics.pixar.com/library/OrthonormalB/paper.pdf
+fn build_onb(n: Vec3) -> (Vec3, Vec3) {
+    let n = n.norm();
+
+    let sign = 1.0_f32.copysign(n.z);
+    let a = -1.0 / (sign + n.z);
+    let b = n.x * n.y * a;
+
+    let t = Vec3::new(1.0 + sign * n.x * n.x * a, sign * b, -sign * n.x);
+    let b = Vec3::new(b, sign + n.y * n.y * a, -n.y);
+
+    (t, b)
+}
+
+fn trace(
+    primary_ray: &Ray,
+    world: &dyn Hittable,
+    max_depth: u32,
+    rr_start: u32,
+    spp: u32,
+    rng: &mut ThreadRng,
+) -> Vec3 {
+    let mut sum = Vec3::zero();
+
+    for _ in 0..spp {
+        let mut radiance = Vec3::zero();
+        let mut throughput = Vec3::one();
+        let mut ray = *primary_ray;
+
+        for i in 0..max_depth {
+            let Some(hit) = world.hit(&ray, 1e-3, f32::INFINITY) else {
+                break;
+            };
+
+            let n = hit.normal;
+            let wo = ray.dir.smul(-1.0);
+
+            match &hit.material {
+                Materials::Emissive(emissive) => {
+                    let emission = emissive.emission(wo, n);
+                    radiance = radiance.add(throughput.mul(emission));
+                    break;
+                }
+
+                Materials::Reflective(reflective) => {
+                    let (wi, pdf, brdf) = reflective.sample_brdf(n, rng);
+                    if pdf <= 1e-8 {
+                        break;
+                    }
+
+                    let cos_i = n.dot(&wi).max(0.0);
+                    if cos_i == 0.0 {
+                        break;
+                    }
+
+                    throughput = throughput.mul(brdf).smul(cos_i / pdf);
+
+                    if i >= rr_start {
+                        let mut q = throughput.max_comp();
+                        q = q.clamp(0.05, 0.95);
+                        if rng.random::<f32>() > q {
+                            break;
+                        }
+                        throughput = throughput.smul(1.0 / q);
+                    }
+
+                    ray = Ray::new(hit.p.add(wi.smul(1e-3)), wi);
+                }
+            }
+        }
+        sum = sum.add(radiance);
+    }
+    sum.smul(1.0 / spp as f32)
 }
 
 fn linear_to_srgb(c: Vec3) -> [u8; 3] {
@@ -452,28 +665,51 @@ fn main() {
         Vec3::new(0.0, 0.0, 1.0),   // Up (0.0, 0.0, 1.0) for Z-up
     );
 
-    let material1 = Lambert::new(Vec3::new(0.74, 0.1, 0.1));
-    let material2 = Lambert::new(Vec3::new(0.16, 0.4, 0.9));
+    let material1 = Arc::new(Lambert::new(Vec3::new(0.74, 0.1, 0.1))); // Red
+    let material2 = Arc::new(Lambert::new(Vec3::new(0.16, 0.4, 0.9))); // Blue
+    let material3 = Arc::new(Lambert::new(Vec3::new(0.07, 0.82, 0.29))); // Green
 
-    let sphere1 = Sphere::new(Vec3::new(0.0, 0.0, 0.0), 1.0, Arc::new(material1));
-    let sphere2 = Sphere::new(Vec3::new(5.0, 0.0, 0.0), 3.0, Arc::new(material2));
+    let sphere1 = Sphere::new(
+        Vec3::new(0.0, 0.0, 0.0),
+        1.0,
+        Materials::Reflective(material1),
+    );
+    let sphere2 = Sphere::new(
+        Vec3::new(5.0, 0.0, 0.0),
+        3.0,
+        Materials::Reflective(material2),
+    );
+    let sphere3 = Sphere::new(
+        Vec3::new(-2.5, 0.0, 0.0),
+        0.5,
+        Materials::Reflective(material3),
+    );
 
-    let area_light = AreaLight::new(
-        Vec3::new(0.0, 0.0, 2.75),  // Position
-        Vec3::new(0.0, 1.5, 0.0),   // Width
-        Vec3::new(1.5, 0.0, 0.0),   // Height
-        Vec3::new(1.0, 0.85, 0.73), // Color ~4500k
-        70.0,                       // Powers
+    let light_u = Vec3::new(1.5, 0.0, 0.0);
+    let light_v = Vec3::new(0.0, 1.5, 0.0);
+
+    let emissive_material = Arc::new(DiffuseEmitter::from_power(
+        Vec3::new(1.0, 0.85, 0.73), // ~4500k
+        70.0,
+        light_u.cross(light_v).length() * 4.0,
+    ));
+    let light = Quad::new(
+        Vec3::new(0.0, 0.0, 2.8),
+        light_u,
+        light_v,
+        Materials::Emissive(emissive_material),
     );
 
     let mut hl = HittableList::new();
     hl.add(sphere1);
     hl.add(sphere2);
+    hl.add(sphere3);
+    hl.add(light);
 
     let pb = ProgressBar::new(width as u64 * height as u64);
     pb.set_style(
         ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {eta}",
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {eta_precise}",
         )
         .unwrap()
         .progress_chars("#>-"),
@@ -485,37 +721,18 @@ fn main() {
 
     for y in 0..height {
         for x in 0..width {
-            let mut color = Vec3::new(0.0, 0.0, 0.0);
+            let jx = rng.random::<f32>();
+            let jy = rng.random::<f32>();
 
-            for _ in 0..spp {
-                let jx = rng.random::<f32>();
-                let jy = rng.random::<f32>();
+            let u = (x as f32 + jx) / width as f32;
+            let v = (y as f32 + jy) / height as f32;
 
-                let u = (x as f32 + jx) / width as f32;
-                let v = (y as f32 + jy) / height as f32;
+            let ray = camera.get_ray(u, v);
 
-                let ray = camera.get_ray(u, v);
+            let color = trace(&ray, &hl, 10, 5, spp, &mut rng);
 
-                let sample_color = if let Some(hit) = hl.hit(&ray, 1e-3, f32::INFINITY) {
-                    lambert_direct_mc(
-                        hit.p,
-                        hit.normal,
-                        hit.material.albedo(),
-                        &area_light,
-                        &hl,
-                        2,
-                        2,
-                        &mut rng,
-                    )
-                } else {
-                    Vec3::new(0.0, 0.0, 0.0)
-                };
-
-                color = color.add(sample_color);
-            }
-            pb.inc(1);
-            color = color.smul(1.0 / spp as f32);
             img.put_pixel(x, height - 1 - y, Rgb(linear_to_srgb(color)));
+            pb.inc(1)
         }
     }
     pb.finish();
