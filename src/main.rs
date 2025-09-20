@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use clap::{ArgAction, Parser};
 use image::RgbImage;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::prelude::*;
@@ -153,6 +154,22 @@ impl Camera {
     ) -> Self {
         let vfov_rad = 2.0 * ((sensor_height * 0.5) / focal_length).atan();
         let aspect = sensor_width / sensor_height;
+        Self::new(aspect, vfov_rad.to_degrees(), look_from, look_at, vup)
+    }
+
+    fn from_resolution(
+        focal_length: f32,
+        sensor_height: f32,
+        width: u32,
+        height: u32,
+        look_from: Vec3,
+        look_at: Vec3,
+        vup: Vec3,
+    ) -> Self {
+        let focal_length_px = focal_length * (height as f32 / sensor_height);
+
+        let vfov_rad = 2.0 * ((height as f32 * 0.5) / focal_length_px).atan();
+        let aspect = width as f32 / height as f32;
         Self::new(aspect, vfov_rad.to_degrees(), look_from, look_at, vup)
     }
 }
@@ -673,18 +690,39 @@ fn linear_to_srgb(c: Vec3) -> [u8; 3] {
     [to8(c.x), to8(c.y), to8(c.z)]
 }
 
+#[derive(Parser)]
+#[command(version, disable_help_flag = true)]
+struct Args {
+    /// Width of the rendered image
+    #[arg(long = "width", default_value_t = 2560)]
+    width: u32,
+
+    /// Height of the rendered image
+    #[arg(long = "height", default_value_t = 1440)]
+    height: u32,
+
+    /// Number of samples used for the renderer
+    #[arg(short = 's', long = "samples", default_value_t = 128)]
+    samples: u32,
+
+    /// Print help
+    #[arg(long = "help", action = ArgAction::Help)]
+    help: Option<bool>,
+}
+
 fn main() {
-    let width = 2560;
-    let height = 1440;
+    let args = Args::parse();
 
-    let spp = 128;
+    let width = args.width;
+    let height = args.height;
 
-    let camera = Camera::from_physical_camera(
+    let camera = Camera::from_resolution(
         50.0,                       // Focal length
-        36.0,                       // Sensor width
-        20.25,                      // Sensor height
+        24.0,                       // Sensor size
+        width,                      // Image width
+        height,                     // Image height
         Vec3::new(0.0, -10.0, 0.0), // Look from
-        Vec3::new(0.0, 0.0, 0.0),   // Look At
+        Vec3::new(0.0, 0.0, 0.0),   // Look at
         Vec3::new(0.0, 0.0, 1.0),   // Up (0.0, 0.0, 1.0) for Z-up
     );
 
@@ -771,7 +809,7 @@ fn main() {
 
                 let ray = camera.get_ray(u, v);
 
-                let color = trace(&ray, &hl, 10, 5, spp, rng);
+                let color = trace(&ray, &hl, 10, 5, args.samples, rng);
 
                 let i = offset + (x as usize) * 3;
                 let [r, g, b] = linear_to_srgb(color);
