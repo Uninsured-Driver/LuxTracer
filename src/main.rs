@@ -1,14 +1,15 @@
 #![allow(dead_code)]
-#![allow(unused_variables)]
 
 use std::{
     f32::{self, consts::PI},
     sync::Arc,
+    time::Duration,
 };
 
-use image::{Rgb, RgbImage};
-use indicatif::{ProgressBar, ProgressStyle};
+use image::RgbImage;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::prelude::*;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy)]
 struct Vec3 {
@@ -156,7 +157,7 @@ impl Camera {
     }
 }
 
-trait Hittable {
+trait Hittable: Send + Sync {
     fn hit(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitInfo>;
 }
 
@@ -218,7 +219,7 @@ impl Lambert {
 }
 
 impl Reflective for Lambert {
-    fn eval_brdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> Vec3 {
+    fn eval_brdf(&self, _wi: Vec3, _wo: Vec3, _n: Vec3) -> Vec3 {
         self.albedo.smul(1.0 / PI)
     }
 
@@ -455,7 +456,7 @@ impl AreaLight {
 }
 
 struct HittableList {
-    objects: Vec<Box<dyn Hittable>>,
+    objects: Vec<Box<dyn Hittable + Send + Sync>>,
 }
 
 impl HittableList {
@@ -463,7 +464,7 @@ impl HittableList {
         Self { objects: vec![] }
     }
 
-    fn add<T: Hittable + 'static>(&mut self, object: T) {
+    fn add<T: Hittable + Send + Sync + 'static>(&mut self, object: T) {
         self.objects.push(Box::new(object));
     }
 }
@@ -636,6 +637,28 @@ fn trace(
     sum.smul(1.0 / spp as f32)
 }
 
+fn distribute_stripes(height: u32, n: usize) -> Vec<(u32, u32)> {
+    let n = n.max(1).min(height as usize);
+    let base = height as usize / n;
+    let rem = height as usize % n;
+
+    let mut y = 0;
+    let mut ranges = Vec::with_capacity(n);
+    for i in 0..n {
+        let h = if i < rem { base + 1 } else { base };
+        if h == 0 {
+            break;
+        };
+
+        let y0 = y as u32;
+        let y1 = (y + h) as u32;
+        ranges.push((y0, y1));
+
+        y += h;
+    }
+    ranges
+}
+
 fn linear_to_srgb(c: Vec3) -> [u8; 3] {
     fn to8(x: f32) -> u8 {
         let x = x.clamp(0.0, 1.0);
@@ -651,15 +674,15 @@ fn linear_to_srgb(c: Vec3) -> [u8; 3] {
 }
 
 fn main() {
-    let width = 2160;
+    let width = 2560;
     let height = 1440;
 
-    let spp = 32;
+    let spp = 128;
 
     let camera = Camera::from_physical_camera(
         50.0,                       // Focal length
         36.0,                       // Sensor width
-        24.0,                       // Sensor height
+        20.25,                      // Sensor height
         Vec3::new(0.0, -10.0, 0.0), // Look from
         Vec3::new(0.0, 0.0, 0.0),   // Look At
         Vec3::new(0.0, 0.0, 1.0),   // Up (0.0, 0.0, 1.0) for Z-up
@@ -706,37 +729,75 @@ fn main() {
     hl.add(sphere3);
     hl.add(light);
 
-    let pb = ProgressBar::new(width as u64 * height as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {eta_precise}",
-        )
-        .unwrap()
-        .progress_chars("#>-"),
-    );
-
     let mut img = RgbImage::new(width, height);
 
-    let mut rng = rand::rng();
+    let mp = MultiProgress::new();
 
-    for y in 0..height {
-        for x in 0..width {
-            let jx = rng.random::<f32>();
-            let jy = rng.random::<f32>();
+    let threads = rayon::current_num_threads().max(1);
+    let thread_distribution = distribute_stripes(height, threads);
 
-            let u = (x as f32 + jx) / width as f32;
-            let v = (y as f32 + jy) / height as f32;
+    let row_stride = width as usize * 3;
 
-            let ray = camera.get_ray(u, v);
+    let img_buffer: Vec<Vec<u8>> = thread_distribution.par_iter().map_init(|| {
+        let rng = rand::rng();
+        let pb = mp.add(ProgressBar::new(0));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {eta_precise}",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+        );
+        pb.enable_steady_tick(Duration::from_millis(33));
+        (rng, pb)
+    }, |state, &(y0, y1)| {
+        let (rng, pb) = state;
+        let h = (y1 - y0) as usize;
+        let total_pixels = h as u64 * width as u64;
+        pb.set_length(total_pixels);
 
-            let color = trace(&ray, &hl, 10, 5, spp, &mut rng);
+        let mut data = vec![0u8; h * row_stride];
 
-            img.put_pixel(x, height - 1 - y, Rgb(linear_to_srgb(color)));
-            pb.inc(1)
+        for ly in 0..h {
+            let y = y0 + ly as u32;
+            let offset = ly * row_stride;
+
+            for x in 0..width {
+                let jx = rng.random::<f32>();
+                let jy = rng.random::<f32>();
+
+                let u = (x as f32 + jx) / width as f32;
+                let v = (y as f32 + jy) / height as f32;
+
+                let ray = camera.get_ray(u, v);
+
+                let color = trace(&ray, &hl, 10, 5, spp, rng);
+
+                let i = offset + (x as usize) * 3;
+                let [r, g, b] = linear_to_srgb(color);
+                data[i] = r;
+                data[i + 1] = g;
+                data[i + 2] = b;
+            }
+            pb.inc(width as u64);
+        }
+        pb.finish();
+        data
+    }).collect();
+    println!();
+
+    for ((y0, y1), data) in thread_distribution.into_iter().zip(img_buffer.into_iter()) {
+        let h = y1 - y0;
+        for ly in 0..h {
+            let y = y0 + ly as u32;
+
+            let src = &data[ly as usize * row_stride..(ly + 1) as usize * row_stride];
+            let dst = &mut img.as_mut()
+                [(height - 1 - y) as usize * row_stride..(height - y) as usize * row_stride];
+
+            dst.copy_from_slice(src);
         }
     }
-    pb.finish();
-    println!();
 
     img.save("render.png").unwrap();
 }
