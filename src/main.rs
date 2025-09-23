@@ -594,7 +594,11 @@ fn build_onb(n: Vec3) -> (Vec3, Vec3) {
 }
 
 fn trace(
-    primary_ray: &Ray,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    camera: &Camera,
     world: &dyn Hittable,
     max_depth: u32,
     rr_start: u32,
@@ -606,7 +610,14 @@ fn trace(
     for _ in 0..spp {
         let mut radiance = Vec3::zero();
         let mut throughput = Vec3::one();
-        let mut ray = *primary_ray;
+
+        let jx = rng.random::<f32>();
+        let jy = rng.random::<f32>();
+
+        let u = (x as f32 + jx) / width as f32;
+        let v = (y as f32 + jy) / height as f32;
+
+        let mut ray = camera.get_ray(u, v);
 
         for i in 0..max_depth {
             let Some(hit) = world.hit(&ray, 1e-3, f32::INFINITY) else {
@@ -676,7 +687,7 @@ fn distribute_stripes(height: u32, n: usize) -> Vec<(u32, u32)> {
     ranges
 }
 
-fn linear_to_srgb(c: Vec3) -> [u8; 3] {
+fn linear_to_srgb(rgb: (f32, f32, f32)) -> [u8; 3] {
     fn to8(x: f32) -> u8 {
         let x = x.clamp(0.0, 1.0);
 
@@ -687,7 +698,7 @@ fn linear_to_srgb(c: Vec3) -> [u8; 3] {
         };
         (s * 255.0 + 0.5) as u8
     }
-    [to8(c.x), to8(c.y), to8(c.z)]
+    [to8(rgb.0), to8(rgb.1), to8(rgb.2)]
 }
 
 #[derive(Parser)]
@@ -705,9 +716,25 @@ struct Args {
     #[arg(short = 's', long = "samples", default_value_t = 128)]
     samples: u32,
 
+    /// Exposure setting
+    #[arg(short = 'e', long = "exposure", default_value_t = 0.0)]
+    exposure: f32,
+
     /// Print help
     #[arg(long = "help", action = ArgAction::Help)]
     help: Option<bool>,
+}
+
+fn aces_tonemapping(rgb: Vec3) -> (f32, f32, f32) {
+    fn map(x: f32) -> f32 {
+        let a = 2.51_f32;
+        let b = 0.03_f32;
+        let c = 2.43_f32;
+        let d = 0.59_f32;
+        let e = 0.14_f32;
+        ((x * (a * x + b)) / (x * (c * x + d) + e)).clamp(0.0, 1.0)
+    }
+    (map(rgb.x), map(rgb.y), map(rgb.z))
 }
 
 fn main() {
@@ -715,6 +742,8 @@ fn main() {
 
     let width = args.width;
     let height = args.height;
+
+    let exposure = args.exposure;
 
     let camera = Camera::from_resolution(
         50.0,                       // Focal length
@@ -755,7 +784,7 @@ fn main() {
         light_u.cross(light_v).length() * 4.0,
     ));
     let light = Quad::new(
-        Vec3::new(0.0, 0.0, 2.8),
+        Vec3::new(0.0, 0.0, 3.0),
         light_u,
         light_v,
         Materials::Emissive(emissive_material),
@@ -766,8 +795,6 @@ fn main() {
     hl.add(sphere2);
     hl.add(sphere3);
     hl.add(light);
-
-    let mut img = RgbImage::new(width, height);
 
     let mp = MultiProgress::new();
 
@@ -801,29 +828,25 @@ fn main() {
             let offset = ly * row_stride;
 
             for x in 0..width {
-                let jx = rng.random::<f32>();
-                let jy = rng.random::<f32>();
-
-                let u = (x as f32 + jx) / width as f32;
-                let v = (y as f32 + jy) / height as f32;
-
-                let ray = camera.get_ray(u, v);
-
-                let color = trace(&ray, &hl, 10, 5, args.samples, rng);
+                let mut color = trace(x, y, width, height, &camera, &hl, 10, 5, args.samples, rng);
+                color = color.smul(2.0f32.powf(exposure));
+                let [r, g, b] = linear_to_srgb(aces_tonemapping(color));
 
                 let i = offset + (x as usize) * 3;
-                let [r, g, b] = linear_to_srgb(color);
+
                 data[i] = r;
                 data[i + 1] = g;
                 data[i + 2] = b;
+
+                pb.inc(1);
             }
-            pb.inc(width as u64);
         }
         pb.finish();
         data
     }).collect();
     println!();
 
+    let mut img = RgbImage::new(width, height);
     for ((y0, y1), data) in thread_distribution.into_iter().zip(img_buffer.into_iter()) {
         let h = y1 - y0;
         for ly in 0..h {
