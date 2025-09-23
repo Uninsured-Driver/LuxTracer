@@ -2,13 +2,17 @@
 
 use std::{
     f32::{self, consts::PI},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
     time::Duration,
 };
 
 use clap::{ArgAction, Parser};
 use image::RgbImage;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::prelude::*;
 use rayon::prelude::*;
 
@@ -665,28 +669,6 @@ fn trace(
     sum.smul(1.0 / spp as f32)
 }
 
-fn distribute_stripes(height: u32, n: usize) -> Vec<(u32, u32)> {
-    let n = n.max(1).min(height as usize);
-    let base = height as usize / n;
-    let rem = height as usize % n;
-
-    let mut y = 0;
-    let mut ranges = Vec::with_capacity(n);
-    for i in 0..n {
-        let h = if i < rem { base + 1 } else { base };
-        if h == 0 {
-            break;
-        };
-
-        let y0 = y as u32;
-        let y1 = (y + h) as u32;
-        ranges.push((y0, y1));
-
-        y += h;
-    }
-    ranges
-}
-
 fn linear_to_srgb(rgb: (f32, f32, f32)) -> [u8; 3] {
     fn to8(x: f32) -> u8 {
         let x = x.clamp(0.0, 1.0);
@@ -765,7 +747,7 @@ fn main() {
         Materials::Reflective(material1),
     );
     let sphere2 = Sphere::new(
-        Vec3::new(5.0, 0.0, 0.0),
+        Vec3::new(5.0, 0.0, 1.5),
         3.0,
         Materials::Reflective(material2),
     );
@@ -790,75 +772,77 @@ fn main() {
         Materials::Emissive(emissive_material),
     );
 
+    let quad = Quad::new(
+        Vec3::new(0.0, 0.0, -1.75),
+        Vec3::new(10.0, 0.0, 0.0),
+        Vec3::new(0.0, 10.0, 0.0),
+        Materials::Reflective(Arc::new(Lambert::new(Vec3::new(1.0, 0.957, 0.898)))),
+    );
+
     let mut hl = HittableList::new();
     hl.add(sphere1);
     hl.add(sphere2);
     hl.add(sphere3);
     hl.add(light);
+    hl.add(quad);
 
-    let mp = MultiProgress::new();
+    let counter = Arc::new(AtomicU64::new(0));
+    let is_done = Arc::new(AtomicBool::new(false));
 
-    let threads = rayon::current_num_threads().max(1);
-    let thread_distribution = distribute_stripes(height, threads);
+    let pb_counter = Arc::clone(&counter);
+    let rayon_counter = Arc::clone(&counter);
+    let pb_is_done = Arc::clone(&is_done);
 
-    let row_stride = width as usize * 3;
+    let pb = ProgressBar::new(width as u64 * height as u64);
+    pb.set_style(ProgressStyle::with_template(
+        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {percent_precise}% {eta_precise}",
+    )
+    .unwrap()
+    .progress_chars("#>-"));
+    pb.enable_steady_tick(Duration::from_millis(33));
 
-    let img_buffer: Vec<Vec<u8>> = thread_distribution.par_iter().map_init(|| {
-        let rng = rand::rng();
-        let pb = mp.add(ProgressBar::new(0));
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {eta_precise}",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
-        );
-        pb.enable_steady_tick(Duration::from_millis(33));
-        (rng, pb)
-    }, |state, &(y0, y1)| {
-        let (rng, pb) = state;
-        let h = (y1 - y0) as usize;
-        let total_pixels = h as u64 * width as u64;
-        pb.set_length(total_pixels);
-
-        let mut data = vec![0u8; h * row_stride];
-
-        for ly in 0..h {
-            let y = y0 + ly as u32;
-            let offset = ly * row_stride;
-
-            for x in 0..width {
-                let mut color = trace(x, y, width, height, &camera, &hl, 10, 5, args.samples, rng);
-                color = color.smul(2.0f32.powf(exposure));
-                let [r, g, b] = linear_to_srgb(aces_tonemapping(color));
-
-                let i = offset + (x as usize) * 3;
-
-                data[i] = r;
-                data[i + 1] = g;
-                data[i + 2] = b;
-
-                pb.inc(1);
-            }
+    let pb_handle = thread::spawn(move || {
+        while !pb_is_done.load(Ordering::Relaxed) {
+            let pos = pb_counter.load(Ordering::Relaxed);
+            pb.set_position(pos);
+            thread::sleep(Duration::from_millis(33));
         }
         pb.finish();
-        data
-    }).collect();
-    println!();
+        println!();
+    });
 
-    let mut img = RgbImage::new(width, height);
-    for ((y0, y1), data) in thread_distribution.into_iter().zip(img_buffer.into_iter()) {
-        let h = y1 - y0;
-        for ly in 0..h {
-            let y = y0 + ly as u32;
+    let row_stride = width as usize * 3;
+    let mut pixels = vec![0u8; width as usize * height as usize * 3];
 
-            let src = &data[ly as usize * row_stride..(ly + 1) as usize * row_stride];
-            let dst = &mut img.as_mut()
-                [(height - 1 - y) as usize * row_stride..(height - y) as usize * row_stride];
+    pixels
+        .par_chunks_mut(row_stride)
+        .enumerate()
+        .map_init(
+            || (rand::rng(), Arc::clone(&rayon_counter)),
+            |(rng, counter), (y_idx, row)| {
+                let y = height - 1 - y_idx as u32;
 
-            dst.copy_from_slice(src);
-        }
-    }
+                for x in 0..width {
+                    let mut color =
+                        trace(x, y, width, height, &camera, &hl, 10, 5, args.samples, rng);
+                    color = color.smul(2.0f32.powf(exposure));
+                    let [r, g, b] = linear_to_srgb(aces_tonemapping(color));
 
-    img.save("render.png").unwrap();
+                    let i = (x as usize) * 3;
+                    row[i] = r;
+                    row[i + 1] = g;
+                    row[i + 2] = b;
+
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+        )
+        .for_each(drop);
+    is_done.store(true, Ordering::Relaxed);
+    pb_handle.join().unwrap();
+
+    RgbImage::from_raw(width, height, pixels)
+        .unwrap()
+        .save("render.png")
+        .unwrap();
 }
