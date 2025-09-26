@@ -411,68 +411,332 @@ impl Hittable for Quad {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AreaLight {
-    center: Vec3,
-    ux: Vec3,
-    vy: Vec3,
-    color: Vec3,
-    power: f32,
+#[derive(Clone)]
+struct Triangle {
+    p0: Vec3,
+    p1: Vec3,
+    p2: Vec3,
+    material: Materials,
 }
 
-impl AreaLight {
-    fn new(center: Vec3, ux: Vec3, vy: Vec3, color: Vec3, power: f32) -> Self {
+impl Triangle {
+    fn new(p0: Vec3, p1: Vec3, p2: Vec3, material: Materials) -> Self {
         Self {
-            center,
-            ux,
-            vy,
-            color,
-            power,
+            p0,
+            p1,
+            p2,
+            material,
+        }
+    }
+}
+
+impl Hittable for Triangle {
+    fn hit(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitInfo> {
+        let e1 = self.p1.sub(self.p0);
+        let e2 = self.p2.sub(self.p0);
+
+        let p = ray.dir.cross(e1);
+        let det = e2.dot(&p);
+        if det.abs() < 1e-8 {
+            return None;
+        }
+        let inv_det = 1.0 / det;
+
+        let tvec = ray.origin.sub(self.p0);
+        let u = tvec.dot(&p) * inv_det;
+        if u < 0.0 || u > 1.0 {
+            return None;
+        }
+
+        let q = tvec.cross(e2);
+        let v = ray.dir.dot(&q) * inv_det;
+        if v < 0.0 || u + v > 1.0 {
+            return None;
+        }
+
+        let t = e1.dot(&q) * inv_det;
+        if t < t_min || t > t_max {
+            return None;
+        }
+
+        let hit_p = ray.at(t);
+
+        let n = e1.cross(e2).norm();
+
+        Some(HitInfo::new(ray, hit_p, n, t, self.material.clone()))
+    }
+}
+
+struct BvhNode {
+    bbox: Aabb,
+    start: u32,
+    count: u32,
+    left: i32,
+    right: i32,
+}
+
+impl BvhNode {
+    fn new_leaf(bbox: Aabb, start: u32, count: u32) -> Self {
+        Self {
+            bbox,
+            start,
+            count,
+            left: -1,
+            right: -1,
         }
     }
 
-    fn normal(&self) -> Vec3 {
-        self.ux.cross(self.vy).norm()
+    fn new_internal(bbox: Aabb, left: i32, right: i32) -> Self {
+        Self {
+            bbox,
+            start: 0,
+            count: 0,
+            left,
+            right,
+        }
+    }
+}
+
+struct Mesh {
+    tris: Vec<Triangle>,
+    indices: Vec<usize>,
+    nodes: Vec<BvhNode>,
+}
+
+impl Mesh {
+    fn from_obj(path: &str, material: Materials, offset: Vec3) -> Self {
+        let (models, _materials) = tobj::load_obj(
+            path,
+            &tobj::LoadOptions {
+                triangulate: true,
+                single_index: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut tris = Vec::new();
+
+        for m in models {
+            let mesh = m.mesh;
+            let pos = &mesh.positions;
+            let idx = &mesh.indices;
+
+            for i in (0..idx.len()).step_by(3) {
+                let i0 = idx[i] as usize;
+                let i1 = idx[i + 1] as usize;
+                let i2 = idx[i + 2] as usize;
+
+                let p0 = Vec3::new(pos[3 * i0], pos[3 * i0 + 1], pos[3 * i0 + 2]).add(offset);
+                let p1 = Vec3::new(pos[3 * i1], pos[3 * i1 + 1], pos[3 * i1 + 2]).add(offset);
+                let p2 = Vec3::new(pos[3 * i2], pos[3 * i2 + 1], pos[3 * i2 + 2]).add(offset);
+
+                tris.push(Triangle::new(p0, p1, p2, material.clone()));
+            }
+        }
+
+        Self {
+            tris,
+            indices: Vec::new(),
+            nodes: Vec::new(),
+        }
     }
 
-    fn area(&self) -> f32 {
-        self.ux.cross(self.vy).length() * 4.0
+    fn build_bvh(&mut self) {
+        // no idea how this works and I don't care enough to find out how
+        if self.tris.is_empty() {
+            self.indices.clear();
+            self.nodes.clear();
+            return;
+        }
+
+        self.nodes.clear();
+        self.indices = (0..self.tris.len()).collect();
+
+        let tri_bb: Vec<Aabb> = self.tris.iter().map(Aabb::from_triangle).collect();
+        let cents: Vec<Vec3> = tri_bb.iter().map(Aabb::centroid).collect();
+
+        fn range_bbox(ids: &[usize], bb: &[Aabb]) -> Aabb {
+            let mut b = bb[ids[0]];
+            for &i in &ids[1..] {
+                b = b.union(bb[i]);
+            }
+            b
+        }
+
+        fn centroid_bbox(ids: &[usize], c: &[Vec3]) -> (Vec3, Vec3) {
+            let mut mn = c[ids[0]];
+            let mut mx = c[ids[0]];
+            for &i in &ids[1..] {
+                let v = c[i];
+                mn = Vec3::new(mn.x.min(v.x), mn.y.min(v.y), mn.z.min(v.z));
+                mx = Vec3::new(mx.x.max(v.x), mx.y.max(v.y), mx.z.max(v.z));
+            }
+            (mn, mx)
+        }
+
+        fn build(
+            nodes: &mut Vec<BvhNode>,
+            ids: &mut [usize],
+            bb: &[Aabb],
+            c: &[Vec3],
+            leaf_max: usize,
+            depth: usize,
+            max_depth: usize,
+        ) -> i32 {
+            let bbox = range_bbox(ids, bb);
+
+            if ids.len() <= leaf_max || depth >= max_depth {
+                let id = nodes.len() as i32;
+                nodes.push(BvhNode::new_leaf(bbox, 0, ids.len() as u32));
+                return id;
+            }
+
+            let (mn, mx) = centroid_bbox(ids, c);
+            let ext = mx.sub(mn);
+            let (axis, extent) = if ext.x >= ext.y && ext.x >= ext.z {
+                (0, ext.x)
+            } else if ext.y >= ext.z {
+                (1, ext.y)
+            } else {
+                (2, ext.z)
+            };
+            if extent < 1e-6 {
+                let id = nodes.len() as i32;
+                nodes.push(BvhNode::new_leaf(bbox, 0, ids.len() as u32));
+                return id;
+            }
+
+            let mid = ids.len() / 2;
+            ids.select_nth_unstable_by(mid, |&a, &b| {
+                let ca = c[a];
+                let cb = c[b];
+                match axis {
+                    0 => ca.x.partial_cmp(&cb.x).unwrap_or(std::cmp::Ordering::Equal),
+                    1 => ca.y.partial_cmp(&cb.y).unwrap_or(std::cmp::Ordering::Equal),
+                    _ => ca.z.partial_cmp(&cb.z).unwrap_or(std::cmp::Ordering::Equal),
+                }
+            });
+
+            let (l_ids, r_ids) = ids.split_at_mut(mid);
+            let l = build(nodes, l_ids, bb, c, leaf_max, depth + 1, max_depth);
+            let r = build(nodes, r_ids, bb, c, leaf_max, depth + 1, max_depth);
+
+            let id = nodes.len() as i32;
+            nodes.push(BvhNode::new_internal(bbox, l, r));
+            id
+        }
+
+        let leaf_max = 4;
+        let max_depth = (2.0 * (self.tris.len().max(1) as f32).log2()).ceil() as usize + 8;
+
+        let root = build(
+            &mut self.nodes,
+            &mut self.indices[..],
+            &tri_bb,
+            &cents,
+            leaf_max,
+            0,
+            max_depth,
+        );
+
+        let mut packed: Vec<usize> = Vec::with_capacity(self.indices.len());
+        fn assign(nodes: &mut [BvhNode], node_id: i32, src: &mut [usize], out: &mut Vec<usize>) {
+            let n = &nodes[node_id as usize];
+            if n.left < 0 {
+                let start = out.len() as u32;
+                out.extend_from_slice(src);
+                let count = src.len() as u32;
+                let nn = &mut nodes[node_id as usize];
+                nn.start = start;
+                nn.count = count;
+                return;
+            }
+
+            let mid = src.len() / 2;
+            let (l, r) = src.split_at_mut(mid);
+            let left = n.left;
+            let right = n.right;
+            assign(nodes, left, l, out);
+            assign(nodes, right, r, out);
+        }
+        assign(&mut self.nodes, root, &mut self.indices[..], &mut packed);
+        self.indices = packed;
     }
+}
 
-    fn sample_point_uniform<R: Rng + ?Sized>(&self, rng: &mut R) -> (Vec3, f32) {
-        let sx = rng.random::<f32>() * 2.0 - 1.0;
-        let sy = rng.random::<f32>() * 2.0 - 1.0;
+impl Hittable for Mesh {
+    fn hit(&self, ray: &Ray, t_min: f32, t_max: f32) -> Option<HitInfo> {
+        if self.nodes.is_empty() {
+            let mut closest = t_max;
+            let mut info = None;
+            for tri in &self.tris {
+                if let Some(h) = tri.hit(ray, t_min, closest) {
+                    closest = h.t;
+                    info = Some(h);
+                }
+            }
+            return info;
+        }
 
-        let y = self.center.add(self.ux.smul(sx)).add(self.vy.smul(sy));
+        let mut stack: [i32; 64] = [0; 64];
+        let mut sp;
 
-        let p_a = 1.0 / self.area().max(1e-8);
+        stack[0] = (self.nodes.len() as i32) - 1;
+        sp = 1;
 
-        (y, p_a)
-    }
+        let mut closest = t_max;
+        let mut info = None;
 
-    fn sample_point_stratified<R: Rng + ?Sized>(
-        &self,
-        rng: &mut R,
-        ix: u32,
-        iy: u32,
-        m: u32,
-        n: u32,
-    ) -> (Vec3, f32) {
-        let jx = rng.random::<f32>();
-        let jy = rng.random::<f32>();
+        while sp > 0 {
+            sp -= 1;
+            let id = stack[sp];
+            let node = &self.nodes[id as usize];
 
-        let u = ((ix as f32 + jx) / m as f32) * 2.0 - 1.0;
-        let v = ((iy as f32 + jy) / n as f32) * 2.0 - 1.0;
+            if !node.bbox.hit(ray, t_min, closest) {
+                continue;
+            }
 
-        let y = self.center.add(self.ux.smul(u)).add(self.vy.smul(v));
+            if node.left < 0 {
+                let start = node.start as usize;
+                let end = start + node.count as usize;
+                for &tri_id in &self.indices[start..end] {
+                    if let Some(h) = self.tris[tri_id].hit(ray, t_min, closest) {
+                        closest = h.t;
+                        info = Some(h);
+                    }
+                }
+                continue;
+            }
 
-        let p_a = 1.0 / self.area().max(1e-8);
-        (y, p_a)
-    }
+            let l = node.left;
+            let r = node.right;
 
-    fn emission(&self) -> Vec3 {
-        let scale = self.power / (self.area().max(1e-8) * PI);
-        self.color.smul(scale)
+            let cl = self.nodes[l as usize]
+                .bbox
+                .centroid()
+                .sub(ray.origin)
+                .dot(&ray.dir);
+            let cr = self.nodes[r as usize]
+                .bbox
+                .centroid()
+                .sub(ray.origin)
+                .dot(&ray.dir);
+
+            if cl <= cr {
+                stack[sp] = r;
+                sp += 1;
+                stack[sp] = l;
+                sp += 1;
+            } else {
+                stack[sp] = l;
+                sp += 1;
+                stack[sp] = r;
+                sp += 1;
+            }
+        }
+
+        info
     }
 }
 
@@ -503,65 +767,6 @@ impl Hittable for HittableList {
         }
         hit
     }
-}
-
-fn visible_to_point(p: Vec3, y: Vec3, world: &dyn Hittable) -> bool {
-    let eps = 1e-3;
-    let v = y.sub(p);
-    let dist = v.length();
-    if dist <= eps {
-        return true;
-    }
-    let dir = v.norm();
-    let shadow_ray = Ray::new(p.add(dir.smul(eps)), dir);
-    world.hit(&shadow_ray, eps, (dist - eps).max(eps)).is_none()
-}
-
-fn lambert_direct_mc<R: Rng + ?Sized>(
-    point: Vec3,
-    normal: Vec3,
-    albedo: Vec3,
-    light: &AreaLight,
-    world: &dyn Hittable,
-    m: u32,
-    n: u32,
-    rng: &mut R,
-) -> Vec3 {
-    let mut sum = Vec3::new(0.0, 0.0, 0.0);
-    let ln = light.normal();
-    let emission = light.emission();
-
-    for ix in 0..m {
-        for iy in 0..n {
-            let (y, p_a) = light.sample_point_stratified(rng, ix, iy, m, n);
-
-            let v = y.sub(point);
-            let r2 = v.dot(&v).max(1e-9);
-            let wi = v.smul(1.0 / r2.sqrt());
-
-            let cos_i = normal.dot(&wi).max(0.0);
-            if cos_i == 0.0 {
-                continue;
-            }
-            let cos_l = ln.dot(&wi.smul(-1.0)).max(0.0);
-            if cos_l == 0.0 {
-                continue;
-            }
-
-            if !visible_to_point(point, y, world) {
-                continue;
-            }
-
-            let brdf = albedo.smul(1.0 / PI);
-            let geom = (cos_i * cos_l) / r2;
-            let contribution = emission.mul(brdf).smul(geom / p_a);
-
-            sum = sum.add(contribution);
-        }
-    }
-
-    let total = (m * n) as f32;
-    sum.smul(1.0 / total)
 }
 
 fn local_to_world(local: Vec3, t: Vec3, b: Vec3, n: Vec3) -> Vec3 {
@@ -719,6 +924,75 @@ fn aces_tonemapping(rgb: Vec3) -> (f32, f32, f32) {
     (map(rgb.x), map(rgb.y), map(rgb.z))
 }
 
+#[derive(Clone, Copy)]
+struct Aabb {
+    min: Vec3,
+    max: Vec3,
+}
+
+impl Aabb {
+    fn new(min: Vec3, max: Vec3) -> Self {
+        Self { min, max }
+    }
+
+    fn union(self, o: Aabb) -> Self {
+        Self {
+            min: Vec3::new(
+                self.min.x.min(o.min.x),
+                self.min.y.min(o.min.y),
+                self.min.z.min(o.min.z),
+            ),
+            max: Vec3::new(
+                self.max.x.max(o.max.x),
+                self.max.y.max(o.max.y),
+                self.max.z.max(o.max.z),
+            ),
+        }
+    }
+
+    fn from_triangle(t: &Triangle) -> Self {
+        let eps = 1e-5;
+        let min = Vec3::new(
+            t.p0.x.min(t.p1.x).min(t.p2.x) - eps,
+            t.p0.y.min(t.p1.y).min(t.p2.y) - eps,
+            t.p0.z.min(t.p1.z).min(t.p2.z) - eps,
+        );
+        let max = Vec3::new(
+            t.p0.x.max(t.p1.x).max(t.p2.x) + eps,
+            t.p0.y.max(t.p1.y).max(t.p2.y) + eps,
+            t.p0.z.max(t.p1.z).max(t.p2.z) + eps,
+        );
+        Aabb { min, max }
+    }
+
+    fn centroid(&self) -> Vec3 {
+        self.min.add(self.max).smul(0.5)
+    }
+
+    fn hit(&self, ray: &Ray, mut t_min: f32, mut t_max: f32) -> bool {
+        for axis in 0..3 {
+            let (o, d, mn, mx) = match axis {
+                0 => (ray.origin.x, ray.dir.x, self.min.x, self.max.x),
+                1 => (ray.origin.y, ray.dir.y, self.min.y, self.max.y),
+                _ => (ray.origin.z, ray.dir.z, self.min.z, self.max.z),
+            };
+            let inv_d = 1.0 / d;
+            let mut t0 = (mn - o) * inv_d;
+            let mut t1 = (mx - o) * inv_d;
+            if inv_d < 0.0 {
+                std::mem::swap(&mut t0, &mut t1);
+            }
+
+            t_min = t_min.max(t0);
+            t_max = t_max.min(t1);
+            if t_max <= t_min {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -740,8 +1014,9 @@ fn main() {
     let material1 = Arc::new(Lambert::new(Vec3::new(0.74, 0.1, 0.1))); // Red
     let material2 = Arc::new(Lambert::new(Vec3::new(0.16, 0.4, 0.9))); // Blue
     let material3 = Arc::new(Lambert::new(Vec3::new(0.07, 0.82, 0.29))); // Green
+    let material4 = Arc::new(Lambert::new(Vec3::new(0.9, 0.9, 0.9))); // White
 
-    let sphere1 = Sphere::new(
+    let _sphere1 = Sphere::new(
         Vec3::new(0.0, 0.0, 0.0),
         1.0,
         Materials::Reflective(material1),
@@ -756,6 +1031,13 @@ fn main() {
         0.5,
         Materials::Reflective(material3),
     );
+
+    let mut mesh = Mesh::from_obj(
+        "suzanne.obj",
+        Materials::Reflective(material4.clone()),
+        Vec3::zero(),
+    );
+    mesh.build_bvh();
 
     let light_u = Vec3::new(1.5, 0.0, 0.0);
     let light_v = Vec3::new(0.0, 1.5, 0.0);
@@ -780,9 +1062,10 @@ fn main() {
     );
 
     let mut hl = HittableList::new();
-    hl.add(sphere1);
+    // hl.add(sphere1);
     hl.add(sphere2);
     hl.add(sphere3);
+    hl.add(mesh);
     hl.add(light);
     hl.add(quad);
 
