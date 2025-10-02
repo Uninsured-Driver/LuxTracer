@@ -73,7 +73,7 @@ impl Vec3 {
     }
 
     // ---------- Utilities ----------
-    fn max_comp(self) -> f32 {
+    fn max_comp(&self) -> f32 {
         self.x.max(self.y).max(self.z)
     }
 }
@@ -222,7 +222,7 @@ enum Materials {
 
 trait Reflective: Send + Sync {
     fn eval_brdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> Vec3;
-    fn sample_brdf(&self, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3);
+    fn sample_brdf(&self, wo: Vec3, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3);
 }
 
 trait Emissive: Send + Sync {
@@ -244,7 +244,7 @@ impl Reflective for Lambert {
         self.albedo.smul(1.0 / PI)
     }
 
-    fn sample_brdf(&self, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3) {
+    fn sample_brdf(&self, _wo: Vec3, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3) {
         let (sample, pdf) = cosine_weighted_sampling(rng);
         let (t, b) = build_onb(n);
         let wi = local_to_world(sample, t, b, n);
@@ -278,6 +278,233 @@ impl Emissive for DiffuseEmitter {
             self.radiance
         } else {
             Vec3::zero()
+        }
+    }
+}
+
+struct Pbr {
+    base_color: Vec3,
+    metallic: f32,
+    alpha: f32,
+    f0: Option<Vec3>,
+}
+
+impl Pbr {
+    fn new(base_color: Vec3, metallic: f32, roughness: f32) -> Self {
+        Self {
+            base_color,
+            metallic: metallic.clamp(0.0, 1.0),
+            alpha: roughness * roughness,
+            f0: None,
+        }
+    }
+    fn from_f0(mut self, f0: Vec3) -> Self {
+        self.f0 = Some(f0);
+        self
+    }
+
+    #[inline]
+    fn safe_rcp(x: f32) -> f32 {
+        1.0 / x.max(1e-8)
+    }
+    #[inline]
+    fn reflect(v: Vec3, n: Vec3) -> Vec3 {
+        v.sub(n.smul(2.0 * v.dot(&n)))
+    }
+
+    fn f0(&self) -> Vec3 {
+        if let Some(f0) = self.f0 {
+            return f0;
+        }
+
+        let f0_dielectric = Vec3::new(0.04, 0.04, 0.04);
+        f0_dielectric
+            .smul(1.0 - self.metallic)
+            .add(self.base_color.smul(self.metallic))
+    }
+
+    fn diffuse_tint(&self, n: Vec3, wo: Vec3) -> Vec3 {
+        if self.metallic >= 0.999 {
+            return Vec3::zero();
+        }
+        let f = schlick_fresnel(n.dot(&wo).max(0.0), self.f0());
+        let ks = luminance(f).clamp(0.0, 1.0);
+        self.base_color.smul(1.0 - ks)
+    }
+
+    fn ggx_ndf_d(n_dot_h: f32, alpha: f32) -> f32 {
+        let a2 = alpha * alpha;
+        let cos2 = (n_dot_h * n_dot_h).max(0.0);
+        let denom = cos2 * (a2 - 1.0) + 1.0;
+        a2 / (PI * denom * denom).max(1e-8)
+    }
+
+    fn smith_g1_exact(n_dot_v: f32, alpha: f32) -> f32 {
+        if n_dot_v <= 0.0 {
+            return 0.0;
+        }
+        let sin2 = (1.0 - n_dot_v * n_dot_v).max(0.0);
+        let tan2 = sin2 * Self::safe_rcp(n_dot_v * n_dot_v);
+        let root = (1.0 + alpha * alpha * tan2).sqrt();
+        2.0 / (1.0 + root)
+    }
+
+    fn smith_g1_schlick(n_dot_v: f32, alpha: f32) -> f32 {
+        if n_dot_v <= 0.0 {
+            return 0.0;
+        }
+        let k = {
+            let t = alpha + 1.0;
+            (t * t) * 0.125
+        };
+        n_dot_v / (n_dot_v * (1.0 - k) + k)
+    }
+
+    fn smith_g(n_dot_l: f32, n_dot_v: f32, alpha: f32) -> f32 {
+        Self::smith_g1_exact(n_dot_l, alpha) * Self::smith_g1_exact(n_dot_v, alpha)
+    }
+
+    fn sample_ggx_vndf_local(wo_local: Vec3, alpha: f32, rng: &mut ThreadRng) -> Vec3 {
+        let vh = Vec3::new(alpha * wo_local.x, alpha * wo_local.y, wo_local.z).norm();
+
+        let lensq = vh.x * vh.x + vh.y * vh.y;
+        let (t1, t2) = if lensq > 0.0 {
+            let inv = 1.0 / lensq.sqrt();
+            let t1 = Vec3::new(-vh.y * inv, vh.x * inv, 0.0);
+            (t1, vh.cross(t1))
+        } else {
+            (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0))
+        };
+
+        let u1 = rng.random::<f32>();
+        let u2 = rng.random::<f32>();
+        let r = u1.sqrt();
+        let phi = 2.0 * PI * u2;
+        let t1c = r * phi.cos();
+        let mut t2c = r * phi.sin();
+
+        let s = 0.5 * (1.0 + vh.z);
+        let tmp = (1.0 - t1c * t1c).max(0.0).sqrt();
+        t2c = (1.0 - s) * tmp + s * t2c;
+
+        let nh = t1
+            .smul(t1c)
+            .add(t2.smul(t2c))
+            .add(vh.smul((1.0 - t1c * t1c - t2c * t2c).max(0.0).sqrt()));
+
+        Vec3::new(alpha * nh.x, alpha * nh.y, nh.z).norm()
+    }
+
+    fn pdf_spec_vndf(wi: Vec3, wo: Vec3, n: Vec3, alpha: f32) -> f32 {
+        let h = wi.add(wo).norm();
+        let n_dot_h = n.dot(&h).max(0.0);
+        let n_dot_v = n.dot(&wo).max(0.0);
+        if n_dot_v <= 0.0 {
+            return 0.0;
+        }
+
+        let d = Self::ggx_ndf_d(n_dot_h, alpha);
+        let g1 = Self::smith_g1_exact(n_dot_v, alpha);
+
+        (d * g1 / (4.0 * n_dot_v.max(1e-8))).max(1e-8)
+    }
+
+    fn eval_spec(&self, wi: Vec3, wo: Vec3, n: Vec3) -> Vec3 {
+        let n_dot_l = n.dot(&wi).max(0.0);
+        let n_dot_v = n.dot(&wo).max(0.0);
+        if n_dot_l <= 0.0 || n_dot_v <= 0.0 {
+            return Vec3::zero();
+        }
+
+        let h = (wi.add(wo)).norm();
+        let n_dot_h = n.dot(&h).max(0.0);
+        let v_dot_h = wo.dot(&h).max(0.0);
+
+        let a = self.alpha;
+
+        let d = Self::ggx_ndf_d(n_dot_h, a);
+        let g = Self::smith_g(n_dot_l, n_dot_v, a);
+        let f = schlick_fresnel(v_dot_h, self.f0());
+
+        f.smul((d * g) * Self::safe_rcp(4.0 * n_dot_l * n_dot_v))
+    }
+
+    fn pdf_spec(&self, wi: Vec3, wo: Vec3, n: Vec3) -> f32 {
+        Self::pdf_spec_vndf(wi, wo, n, self.alpha)
+    }
+}
+
+impl Reflective for Pbr {
+    fn eval_brdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> Vec3 {
+        let cos_l = n.dot(&wi).max(0.0);
+        let cos_v = n.dot(&wo).max(0.0);
+        if cos_l <= 0.0 || cos_v <= 0.0 {
+            return Vec3::zero();
+        }
+
+        let spec = self.eval_spec(wi, wo, n);
+        let diff = self.diffuse_tint(n, wo).smul(1.0 / PI);
+
+        diff.add(spec)
+    }
+
+    fn sample_brdf(&self, wo: Vec3, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3) {
+        let n_dot_v = n.dot(&wo).max(0.0);
+        if n_dot_v <= 0.0 {
+            return (Vec3::zero(), 1.0, Vec3::zero());
+        }
+
+        if self.alpha < 1e-5 {
+            let wi = Self::reflect(wo.smul(-1.0), n);
+            if n.dot(&wi) <= 0.0 {
+                return (Vec3::zero(), 1.0, Vec3::zero());
+            }
+
+            let n_dot_v = n.dot(&wo).max(0.0);
+            let n_dot_i = n.dot(&wi).max(1e-8);
+            let f = schlick_fresnel(n_dot_v, self.f0());
+            let brdf = f.smul(1.0 / n_dot_i);
+            return (wi, 1.0, brdf);
+        }
+
+        let (t, b) = build_onb(n);
+        let wo_local = world_to_local(wo, t, b, n);
+
+        let ks = luminance(schlick_fresnel(n_dot_v, self.f0())).clamp(0.05, 0.95);
+
+        let pdf_diff = |wi: Vec3| -> f32 {
+            let c = n.dot(&wi).max(0.0);
+            (c / PI).max(1e-8)
+        };
+
+        if rng.random::<f32>() < ks {
+            let h_local = Self::sample_ggx_vndf_local(wo_local, self.alpha, rng);
+            let h = local_to_world(h_local, t, b, n);
+            let wi = Self::reflect(wo.smul(-1.0), h);
+
+            if n.dot(&wi) <= 0.0 {
+                return (Vec3::zero(), 1.0, Vec3::zero());
+            }
+
+            let pdf_s = self.pdf_spec(wi, wo, n);
+            let pdf_d = pdf_diff(wi);
+            let pdf = (ks * pdf_s + (1.0 - ks) * pdf_d).max(1e-8);
+
+            let brdf = self.eval_brdf(wi, wo, n);
+            (wi, pdf, brdf)
+        } else {
+            let (samp, _pdf_local) = cosine_weighted_sampling(rng);
+            let wi = local_to_world(samp, t, b, n);
+            if n.dot(&wi) <= 0.0 {
+                return (Vec3::zero(), 1.0, Vec3::zero());
+            }
+
+            let pdf_s = self.pdf_spec(wi, wo, n);
+            let pdf_d = pdf_diff(wi);
+            let pdf = (ks * pdf_s + (1.0 - ks) * pdf_d).max(1e-8);
+
+            let brdf = self.eval_brdf(wi, wo, n);
+            (wi, pdf, brdf)
         }
     }
 }
@@ -355,6 +582,12 @@ impl Quad {
     fn area(&self) -> f32 {
         self.ux.cross(self.vy).length() * 4.0
     }
+
+    fn emissive_from_power(center: Vec3, ux: Vec3, vy: Vec3, color: Vec3, power: f32) -> Self {
+        let area = ux.cross(vy).length() * 4.0;
+        let emitter = Arc::new(DiffuseEmitter::from_power(color, power, area));
+        Quad::new(center, ux, vy, Materials::Emissive(emitter))
+    }
 }
 
 impl Hittable for Quad {
@@ -386,7 +619,7 @@ impl Hittable for Quad {
         let rhs1 = self.vy.dot(&r);
 
         let det = m00 * m11 - m01 * m01;
-        if det.abs() < 1e-3 {
+        if det.abs() < 1e-8 {
             return None;
         }
 
@@ -504,7 +737,7 @@ struct Mesh {
 }
 
 impl Mesh {
-    fn from_obj(path: &str, material: Materials, offset: Vec3) -> Self {
+    fn from_obj(path: &str, material: Materials, offset: Vec3, scale: Vec3) -> Self {
         let (models, _materials) = tobj::load_obj(
             path,
             &tobj::LoadOptions {
@@ -527,9 +760,15 @@ impl Mesh {
                 let i1 = idx[i + 1] as usize;
                 let i2 = idx[i + 2] as usize;
 
-                let p0 = Vec3::new(pos[3 * i0], pos[3 * i0 + 1], pos[3 * i0 + 2]).add(offset);
-                let p1 = Vec3::new(pos[3 * i1], pos[3 * i1 + 1], pos[3 * i1 + 2]).add(offset);
-                let p2 = Vec3::new(pos[3 * i2], pos[3 * i2 + 1], pos[3 * i2 + 2]).add(offset);
+                let p0 = Vec3::new(pos[3 * i0], pos[3 * i0 + 1], pos[3 * i0 + 2])
+                    .mul(scale)
+                    .add(offset);
+                let p1 = Vec3::new(pos[3 * i1], pos[3 * i1 + 1], pos[3 * i1 + 2])
+                    .mul(scale)
+                    .add(offset);
+                let p2 = Vec3::new(pos[3 * i2], pos[3 * i2 + 1], pos[3 * i2 + 2])
+                    .mul(scale)
+                    .add(offset);
 
                 tris.push(Triangle::new(p0, p1, p2, material.clone()));
             }
@@ -543,7 +782,6 @@ impl Mesh {
     }
 
     fn build_bvh(&mut self) {
-        // no idea how this works and I don't care enough to find out how
         if self.tris.is_empty() {
             self.indices.clear();
             self.nodes.clear();
@@ -773,6 +1011,10 @@ fn local_to_world(local: Vec3, t: Vec3, b: Vec3, n: Vec3) -> Vec3 {
     t.smul(local.x).add(b.smul(local.y)).add(n.smul(local.z))
 }
 
+fn world_to_local(v: Vec3, t: Vec3, b: Vec3, n: Vec3) -> Vec3 {
+    Vec3::new(v.dot(&t), v.dot(&b), v.dot(&n))
+}
+
 fn cosine_weighted_sampling<R: Rng + ?Sized>(rng: &mut R) -> (Vec3, f32) {
     let u1 = rng.random::<f32>();
     let u2 = rng.random::<f32>();
@@ -802,6 +1044,28 @@ fn build_onb(n: Vec3) -> (Vec3, Vec3) {
     (t, b)
 }
 
+#[inline]
+fn offset_ray_origin(p: Vec3, n: Vec3, wo: Vec3) -> Vec3 {
+    let threshold: f32 = 1.0 / 32.0;
+    let float_scale = 1.0 / 65536.0;
+    let int_scale = 256;
+
+    let n = if n.dot(&wo) > 0.0 { n } else { n.smul(-1.0) };
+
+    let bump = |p: f32, n: f32| -> f32 {
+        if p.abs() < threshold {
+            p + n * float_scale
+        } else {
+            let step = if n >= 0.0 { int_scale } else { -int_scale };
+            let bits = p.to_bits() as i32;
+            let shifted = if p < 0.0 { bits - step } else { bits + step };
+            f32::from_bits(shifted as u32)
+        }
+    };
+
+    Vec3::new(bump(p.x, n.x), bump(p.y, n.y), bump(p.z, n.z))
+}
+
 fn trace(
     x: u32,
     y: u32,
@@ -829,7 +1093,7 @@ fn trace(
         let mut ray = camera.get_ray(u, v);
 
         for i in 0..max_depth {
-            let Some(hit) = world.hit(&ray, 1e-3, f32::INFINITY) else {
+            let Some(hit) = world.hit(&ray, 0.0, f32::INFINITY) else {
                 break;
             };
 
@@ -844,7 +1108,7 @@ fn trace(
                 }
 
                 Materials::Reflective(reflective) => {
-                    let (wi, pdf, brdf) = reflective.sample_brdf(n, rng);
+                    let (wi, pdf, brdf) = reflective.sample_brdf(wo, n, rng);
                     if pdf <= 1e-8 {
                         break;
                     }
@@ -865,7 +1129,8 @@ fn trace(
                         throughput = throughput.smul(1.0 / q);
                     }
 
-                    ray = Ray::new(hit.p.add(wi.smul(1e-3)), wi);
+                    let offset_origin = offset_ray_origin(hit.p, hit.normal, wo);
+                    ray = Ray::new(offset_origin, wi);
                 }
             }
         }
@@ -993,6 +1258,18 @@ impl Aabb {
     }
 }
 
+fn clamp01(x: f32) -> f32 {
+    x.max(0.0).min(1.0)
+}
+
+fn schlick_fresnel(theta: f32, f0: Vec3) -> Vec3 {
+    f0.add(Vec3::one().sub(f0).smul((1.0 - clamp01(theta)).powi(5)))
+}
+
+fn luminance(v: Vec3) -> f32 {
+    0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -1002,72 +1279,76 @@ fn main() {
     let exposure = args.exposure;
 
     let camera = Camera::from_resolution(
-        50.0,                       // Focal length
-        24.0,                       // Sensor size
-        width,                      // Image width
-        height,                     // Image height
-        Vec3::new(0.0, -10.0, 0.0), // Look from
-        Vec3::new(0.0, 0.0, 0.0),   // Look at
-        Vec3::new(0.0, 0.0, 1.0),   // Up (0.0, 0.0, 1.0) for Z-up
+        24.0,                         // Focal length
+        24.0,                         // Sensor size
+        width,                        // Image width
+        height,                       // Image height
+        Vec3::new(0.0, -2.197, 0.76), // Look from
+        Vec3::new(0.0, 0.0, 0.76),    // Look at
+        Vec3::new(0.0, 0.0, 1.0),     // Up (0.0, 0.0, 1.0) for Z-up
     );
 
-    let material1 = Arc::new(Lambert::new(Vec3::new(0.74, 0.1, 0.1))); // Red
-    let material2 = Arc::new(Lambert::new(Vec3::new(0.16, 0.4, 0.9))); // Blue
-    let material3 = Arc::new(Lambert::new(Vec3::new(0.07, 0.82, 0.29))); // Green
-    let material4 = Arc::new(Lambert::new(Vec3::new(0.9, 0.9, 0.9))); // White
-
-    let _sphere1 = Sphere::new(
-        Vec3::new(0.0, 0.0, 0.0),
-        1.0,
-        Materials::Reflective(material1),
-    );
-    let sphere2 = Sphere::new(
-        Vec3::new(5.0, 0.0, 1.5),
-        3.0,
-        Materials::Reflective(material2),
-    );
-    let sphere3 = Sphere::new(
-        Vec3::new(-2.5, 0.0, 0.0),
-        0.5,
-        Materials::Reflective(material3),
-    );
+    let material1 = Arc::new(Lambert::new(Vec3::new(0.63, 0.065, 0.05))); // Red
+    let material2 = Arc::new(Lambert::new(Vec3::new(0.14, 0.45, 0.091))); // Green
+    let material3 = Arc::new(Lambert::new(Vec3::new(0.725, 0.71, 0.68))); // White
+    let material4 =
+        Arc::new(Pbr::new(Vec3::zero(), 1.0, 0.0).from_f0(Vec3::new(1.059, 0.773, 0.307))); // Gold
 
     let mut mesh = Mesh::from_obj(
-        "suzanne.obj",
+        "stanford_dragon.obj",
         Materials::Reflective(material4.clone()),
-        Vec3::zero(),
+        Vec3::new(-0.05, 0.0, 0.395),
+        Vec3::new(0.75, 0.75, 0.75),
     );
     mesh.build_bvh();
 
-    let light_u = Vec3::new(1.5, 0.0, 0.0);
-    let light_v = Vec3::new(0.0, 1.5, 0.0);
-
-    let emissive_material = Arc::new(DiffuseEmitter::from_power(
-        Vec3::new(1.0, 0.85, 0.73), // ~4500k
-        70.0,
-        light_u.cross(light_v).length() * 4.0,
-    ));
-    let light = Quad::new(
-        Vec3::new(0.0, 0.0, 3.0),
-        light_u,
-        light_v,
-        Materials::Emissive(emissive_material),
+    let light = Quad::emissive_from_power(
+        Vec3::new(0.000, 0.000, 1.523),
+        Vec3::new(0.1785, 0.000, 0.000),
+        Vec3::new(0.000, -0.1440, 0.000),
+        Vec3::new(1.0, 1.0, 1.0),
+        10.0,
     );
 
-    let quad = Quad::new(
-        Vec3::new(0.0, 0.0, -1.75),
-        Vec3::new(10.0, 0.0, 0.0),
-        Vec3::new(0.0, 10.0, 0.0),
-        Materials::Reflective(Arc::new(Lambert::new(Vec3::new(1.0, 0.957, 0.898)))),
+    let quad1 = Quad::new(
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.762, 0.0, 0.0),
+        Vec3::new(0.0, 0.762, 0.0),
+        Materials::Reflective(material3.clone()),
+    );
+    let quad2 = Quad::new(
+        Vec3::new(-0.762, 0.0, 0.762),
+        Vec3::new(0.000, 0.762, 0.000),
+        Vec3::new(0.000, 0.000, 0.762),
+        Materials::Reflective(material1.clone()),
+    );
+    let quad3 = Quad::new(
+        Vec3::new(0.762, 0.000, 0.762),
+        Vec3::new(0.000, 0.762, 0.000),
+        Vec3::new(0.000, 0.000, 0.762),
+        Materials::Reflective(material2.clone()),
+    );
+    let quad4 = Quad::new(
+        Vec3::new(0.000, 0.762, 0.762),
+        Vec3::new(0.762, 0.000, 0.000),
+        Vec3::new(0.000, 0.000, 0.762),
+        Materials::Reflective(material3.clone()),
+    );
+    let quad5 = Quad::new(
+        Vec3::new(0.000, 0.000, 1.524),
+        Vec3::new(0.762, 0.000, 0.000),
+        Vec3::new(0.000, 0.762, 0.000),
+        Materials::Reflective(material3.clone()),
     );
 
     let mut hl = HittableList::new();
-    // hl.add(sphere1);
-    hl.add(sphere2);
-    hl.add(sphere3);
     hl.add(mesh);
     hl.add(light);
-    hl.add(quad);
+    hl.add(quad1);
+    hl.add(quad2);
+    hl.add(quad3);
+    hl.add(quad4);
+    hl.add(quad5);
 
     let counter = Arc::new(AtomicU64::new(0));
     let is_done = Arc::new(AtomicBool::new(false));
