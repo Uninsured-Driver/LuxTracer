@@ -76,6 +76,9 @@ impl Vec3 {
     fn max_comp(&self) -> f32 {
         self.x.max(self.y).max(self.z)
     }
+    fn mean(&self) -> f32 {
+        (self.x + self.y + self.z) / 3.0
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -223,6 +226,7 @@ enum Materials {
 trait Reflective: Send + Sync {
     fn eval_brdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> Vec3;
     fn sample_brdf(&self, wo: Vec3, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3);
+    fn sample_pdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> f32;
 }
 
 trait Emissive: Send + Sync {
@@ -253,6 +257,11 @@ impl Reflective for Lambert {
 
         (wi, pdf, brdf)
     }
+
+    fn sample_pdf(&self, wi: Vec3, _wo: Vec3, n: Vec3) -> f32 {
+        let c = n.dot(&wi).max(0.0);
+        (c / PI).max(1e-8)
+    }
 }
 
 struct DiffuseEmitter {
@@ -280,6 +289,20 @@ impl Emissive for DiffuseEmitter {
             Vec3::zero()
         }
     }
+}
+
+struct LightSample {
+    wi: Vec3,
+    dist: f32,
+    y: Vec3,
+    light_normal: Vec3,
+    radiance: Vec3,
+    pdf: f32,
+}
+
+trait Light: Send + Sync {
+    fn sample(&self, x: Vec3, n: Vec3, rng: &mut ThreadRng) -> LightSample;
+    fn pdf(&self, x: Vec3, wi: Vec3) -> f32;
 }
 
 struct Pbr {
@@ -323,16 +346,18 @@ impl Pbr {
             .add(self.base_color.smul(self.metallic))
     }
 
-    fn diffuse_tint(&self, n: Vec3, wo: Vec3) -> Vec3 {
-        if self.metallic >= 0.999 {
+    fn diffuse_tint(&self) -> Vec3 {
+        if self.metallic >= 0.9999 {
             return Vec3::zero();
         }
-        let f = schlick_fresnel(n.dot(&wo).max(0.0), self.f0());
-        let ks = luminance(f).clamp(0.0, 1.0);
+
+        let f0 = self.f0();
+        let f_avg = f0.add(Vec3::one().sub(f0).smul(1.0 / 21.0));
+        let ks = f_avg.mean();
         self.base_color.smul(1.0 - ks)
     }
 
-    fn ggx_ndf_d(n_dot_h: f32, alpha: f32) -> f32 {
+    fn ggx_ndf(n_dot_h: f32, alpha: f32) -> f32 {
         let a2 = alpha * alpha;
         let cos2 = (n_dot_h * n_dot_h).max(0.0);
         let denom = cos2 * (a2 - 1.0) + 1.0;
@@ -403,10 +428,11 @@ impl Pbr {
             return 0.0;
         }
 
-        let d = Self::ggx_ndf_d(n_dot_h, alpha);
+        let v_dot_h = wo.dot(&h).max(1e-8);
+        let d = Self::ggx_ndf(n_dot_h, alpha);
         let g1 = Self::smith_g1_exact(n_dot_v, alpha);
 
-        (d * g1 / (4.0 * n_dot_v.max(1e-8))).max(1e-8)
+        (d * g1 * n_dot_h / (4.0 * v_dot_h)).max(1e-8)
     }
 
     fn eval_spec(&self, wi: Vec3, wo: Vec3, n: Vec3) -> Vec3 {
@@ -422,7 +448,7 @@ impl Pbr {
 
         let a = self.alpha;
 
-        let d = Self::ggx_ndf_d(n_dot_h, a);
+        let d = Self::ggx_ndf(n_dot_h, a);
         let g = Self::smith_g(n_dot_l, n_dot_v, a);
         let f = schlick_fresnel(v_dot_h, self.f0());
 
@@ -443,7 +469,7 @@ impl Reflective for Pbr {
         }
 
         let spec = self.eval_spec(wi, wo, n);
-        let diff = self.diffuse_tint(n, wo).smul(1.0 / PI);
+        let diff = self.diffuse_tint().smul(1.0 / PI);
 
         diff.add(spec)
     }
@@ -470,7 +496,9 @@ impl Reflective for Pbr {
         let (t, b) = build_onb(n);
         let wo_local = world_to_local(wo, t, b, n);
 
-        let ks = luminance(schlick_fresnel(n_dot_v, self.f0())).clamp(0.05, 0.95);
+        let f0 = self.f0();
+        let f_avg = f0.add(Vec3::one().sub(f0).smul(1.0 / 21.0));
+        let ks = f_avg.mean();
 
         let pdf_diff = |wi: Vec3| -> f32 {
             let c = n.dot(&wi).max(0.0);
@@ -506,6 +534,25 @@ impl Reflective for Pbr {
             let brdf = self.eval_brdf(wi, wo, n);
             (wi, pdf, brdf)
         }
+    }
+
+    fn sample_pdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> f32 {
+        let n_dot_v = n.dot(&wo).max(0.0);
+        let n_dot_i = n.dot(&wi).max(0.0);
+        if n_dot_v <= 0.0 || n_dot_i <= 0.0 {
+            return 0.0;
+        }
+
+        if self.alpha < 1e-5 {
+            return 0.0;
+        }
+
+        let p_spec = self.pdf_spec(wi, wo, n);
+        let p_dff = (n_dot_i / PI).max(1e-8);
+        let f0 = self.f0();
+        let f_avg = f0.add(Vec3::one().sub(f0).smul(1.0 / 21.0));
+        let ks = f_avg.mean();
+        ((ks * p_spec) + (1.0 - ks) * p_dff).max(1e-8)
     }
 }
 
@@ -562,6 +609,7 @@ impl Hittable for Sphere {
     }
 }
 
+#[derive(Clone)]
 struct Quad {
     center: Vec3,
     ux: Vec3,
@@ -587,6 +635,63 @@ impl Quad {
         let area = ux.cross(vy).length() * 4.0;
         let emitter = Arc::new(DiffuseEmitter::from_power(color, power, area));
         Quad::new(center, ux, vy, Materials::Emissive(emitter))
+    }
+
+    #[inline]
+    fn normal(&self) -> Vec3 {
+        self.ux.cross(self.vy).norm()
+    }
+
+    #[inline]
+    fn sample_point(&self, rng: &mut ThreadRng) -> (Vec3, f32) {
+        let u = rng.random::<f32>() * 2.0 - 1.0;
+        let v = rng.random::<f32>() * 2.0 - 1.0;
+        let y = self.center.add(self.ux.smul(u)).add(self.vy.smul(v));
+        let pdf_a = 1.0 / self.area().max(1e-8);
+
+        (y, pdf_a)
+    }
+
+    fn intersect_from(&self, x: Vec3, wi: Vec3) -> Option<(f32, Vec3)> {
+        let n = self.normal();
+        let denom = n.dot(&wi);
+        if denom.abs() < 1e-6 {
+            return None;
+        }
+        let t = n.dot(&self.center.sub(x)) / denom;
+        if t <= 0.0 {
+            return None;
+        }
+
+        let p = x.add(wi.smul(t));
+        let r = p.sub(self.center);
+
+        let m00 = self.ux.dot(&self.ux);
+        let m01 = self.ux.dot(&self.vy);
+        let m11 = self.vy.dot(&self.vy);
+        let rhs0 = self.ux.dot(&r);
+        let rhs1 = self.vy.dot(&r);
+
+        let det = m00 * m11 - m01 * m01;
+        if det.abs() < 1e-8 {
+            return None;
+        }
+
+        let inv = 1.0 / det;
+        let a = (rhs0 * m11 - rhs1 * m01) * inv;
+        let b = (rhs1 * m00 - rhs0 * m01) * inv;
+
+        if a < -1.0 || a > 1.0 || b < -1.0 || b > 1.0 {
+            return None;
+        }
+        Some((t, n))
+    }
+
+    fn is_emissive(&self) -> Option<&dyn Emissive> {
+        match &self.material {
+            Materials::Emissive(e) => Some(e.as_ref()),
+            _ => None,
+        }
     }
 }
 
@@ -641,6 +746,65 @@ impl Hittable for Quad {
             front_face,
             material: self.material.clone(),
         })
+    }
+}
+
+impl Light for Quad {
+    fn sample(&self, x: Vec3, _n: Vec3, rng: &mut ThreadRng) -> LightSample {
+        let light_normal = self.normal();
+
+        let (y, pdf_a) = self.sample_point(rng);
+
+        let to_y = y.sub(x);
+        let dist2 = to_y.dot(&to_y).max(1e-12);
+        let dist = dist2.sqrt();
+        let wi = if dist > 0.0 {
+            to_y.norm()
+        } else {
+            Vec3::new(0.0, 0.0, 1.0)
+        };
+
+        let cos_l = light_normal.dot(&wi.smul(-1.0)).max(0.0);
+
+        if cos_l <= 0.0 {
+            return LightSample {
+                wi,
+                dist,
+                y,
+                light_normal,
+                radiance: Vec3::zero(),
+                pdf: 0.0,
+            };
+        }
+
+        let pdf = ((dist2 / cos_l) * pdf_a).max(1e-8);
+        let radiance = if let Some(emissive) = self.is_emissive() {
+            emissive.emission(wi.smul(-1.0), light_normal)
+        } else {
+            Vec3::zero()
+        };
+
+        LightSample {
+            wi,
+            dist,
+            y,
+            light_normal,
+            radiance,
+            pdf,
+        }
+    }
+    fn pdf(&self, x: Vec3, wi: Vec3) -> f32 {
+        if let Some((t, light_normal)) = self.intersect_from(x, wi) {
+            let cos_l = light_normal.dot(&wi.smul(-1.0)).max(0.0);
+            if cos_l <= 0.0 {
+                return 0.0;
+            }
+
+            let dist2 = (t * t).max(1e-12);
+            let pdf_a = (1.0 / self.area()).max(1e-8);
+            return (dist2 / cos_l) * pdf_a;
+        }
+        0.0
     }
 }
 
@@ -917,7 +1081,7 @@ impl Hittable for Mesh {
             return info;
         }
 
-        let mut stack: [i32; 64] = [0; 64];
+        let mut stack: [i32; 128] = [0; 128];
         let mut sp;
 
         stack[0] = (self.nodes.len() as i32) - 1;
@@ -979,7 +1143,7 @@ impl Hittable for Mesh {
 }
 
 struct HittableList {
-    objects: Vec<Box<dyn Hittable + Send + Sync>>,
+    objects: Vec<Box<dyn Hittable>>,
 }
 
 impl HittableList {
@@ -987,7 +1151,7 @@ impl HittableList {
         Self { objects: vec![] }
     }
 
-    fn add<T: Hittable + Send + Sync + 'static>(&mut self, object: T) {
+    fn add<T: Hittable + 'static>(&mut self, object: T) {
         self.objects.push(Box::new(object));
     }
 }
@@ -1045,12 +1209,12 @@ fn build_onb(n: Vec3) -> (Vec3, Vec3) {
 }
 
 #[inline]
-fn offset_ray_origin(p: Vec3, n: Vec3, wo: Vec3) -> Vec3 {
+fn offset_ray_origin(p: Vec3, n: Vec3, wi: Vec3) -> Vec3 {
     let threshold: f32 = 1.0 / 32.0;
     let float_scale = 1.0 / 65536.0;
     let int_scale = 256;
 
-    let n = if n.dot(&wo) > 0.0 { n } else { n.smul(-1.0) };
+    let n = if n.dot(&wi) > 0.0 { n } else { n.smul(-1.0) };
 
     let bump = |p: f32, n: f32| -> f32 {
         if p.abs() < threshold {
@@ -1066,6 +1230,17 @@ fn offset_ray_origin(p: Vec3, n: Vec3, wo: Vec3) -> Vec3 {
     Vec3::new(bump(p.x, n.x), bump(p.y, n.y), bump(p.z, n.z))
 }
 
+#[inline]
+fn mis_power(pdf_a: f32, pdf_b: f32) -> f32 {
+    let a2 = pdf_a * pdf_a;
+    let b2 = pdf_b * pdf_b;
+    if a2 + b2 <= 1e-16 {
+        0.0
+    } else {
+        a2 / (a2 + b2)
+    }
+}
+
 fn trace(
     x: u32,
     y: u32,
@@ -1073,6 +1248,7 @@ fn trace(
     height: u32,
     camera: &Camera,
     world: &dyn Hittable,
+    light: &dyn Light,
     max_depth: u32,
     rr_start: u32,
     spp: u32,
@@ -1097,6 +1273,7 @@ fn trace(
                 break;
             };
 
+            let p = hit.p;
             let n = hit.normal;
             let wo = ray.dir.smul(-1.0);
 
@@ -1108,8 +1285,35 @@ fn trace(
                 }
 
                 Materials::Reflective(reflective) => {
-                    let (wi, pdf, brdf) = reflective.sample_brdf(wo, n, rng);
-                    if pdf <= 1e-8 {
+                    // ---------- Next-Event Estimation ----------
+                    let ls = light.sample(p, n, rng);
+                    if ls.pdf > 1e-8 {
+                        let cos_i = n.dot(&ls.wi).max(0.0);
+                        if cos_i > 0.0 && ls.radiance.max_comp() > 0.0 {
+                            let origin = offset_ray_origin(p, n, ls.wi);
+                            let shadow_ray = Ray::new(origin, ls.wi);
+
+                            let int_scale = 256;
+                            let bits = ls.dist.to_bits();
+                            let shifted = bits - int_scale;
+                            let t_max = f32::from_bits(shifted as u32);
+
+                            let visible = world.hit(&shadow_ray, 0.0, t_max).is_none();
+
+                            if visible {
+                                let f = reflective.eval_brdf(ls.wi, wo, n);
+                                let p_brdf = reflective.sample_pdf(ls.wi, wo, n);
+
+                                let w = mis_power(ls.pdf, p_brdf);
+                                let contrib = f.mul(ls.radiance).smul(cos_i * w / ls.pdf);
+                                radiance = radiance.add(throughput.mul(contrib));
+                            }
+                        }
+                    }
+
+                    // ---------- BRDF Sampling ----------
+                    let (wi, p_brdf, brdf) = reflective.sample_brdf(wo, n, rng);
+                    if p_brdf <= 1e-8 {
                         break;
                     }
 
@@ -1118,7 +1322,21 @@ fn trace(
                         break;
                     }
 
-                    throughput = throughput.mul(brdf).smul(cos_i / pdf);
+                    let offset_origin = offset_ray_origin(p, n, wi);
+                    let test_ray = Ray::new(offset_origin, wi);
+                    if let Some(hit) = world.hit(&test_ray, 0.0, f32::INFINITY) {
+                        if let Materials::Emissive(emissive) = &hit.material {
+                            let emission = emissive.emission(wi.smul(-1.0), hit.normal);
+                            if emission.max_comp() > 0.0 {
+                                let p_light = light.pdf(p, wi);
+
+                                let w = mis_power(p_brdf, p_light);
+                                let contrib = brdf.mul(emission).smul(cos_i * w / p_brdf);
+                                radiance = radiance.add(throughput.mul(contrib));
+                                break;
+                            }
+                        }
+                    }
 
                     if i >= rr_start {
                         let mut q = throughput.max_comp();
@@ -1129,7 +1347,8 @@ fn trace(
                         throughput = throughput.smul(1.0 / q);
                     }
 
-                    let offset_origin = offset_ray_origin(hit.p, hit.normal, wo);
+                    throughput = throughput.mul(brdf).smul(cos_i / p_brdf);
+
                     ray = Ray::new(offset_origin, wi);
                 }
             }
@@ -1157,15 +1376,15 @@ fn linear_to_srgb(rgb: (f32, f32, f32)) -> [u8; 3] {
 #[command(version, disable_help_flag = true)]
 struct Args {
     /// Width of the rendered image
-    #[arg(long = "width", default_value_t = 2560)]
+    #[arg(short = 'w', long = "width", default_value_t = 2560)]
     width: u32,
 
     /// Height of the rendered image
-    #[arg(long = "height", default_value_t = 1440)]
+    #[arg(short = 'h', long = "height", default_value_t = 1440)]
     height: u32,
 
     /// Number of samples used for the renderer
-    #[arg(short = 's', long = "samples", default_value_t = 128)]
+    #[arg(short = 's', long = "samples", default_value_t = 256)]
     samples: u32,
 
     /// Exposure setting
@@ -1262,12 +1481,8 @@ fn clamp01(x: f32) -> f32 {
     x.max(0.0).min(1.0)
 }
 
-fn schlick_fresnel(theta: f32, f0: Vec3) -> Vec3 {
-    f0.add(Vec3::one().sub(f0).smul((1.0 - clamp01(theta)).powi(5)))
-}
-
-fn luminance(v: Vec3) -> f32 {
-    0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z
+fn schlick_fresnel(cos_theta: f32, f0: Vec3) -> Vec3 {
+    f0.add(Vec3::one().sub(f0).smul((1.0 - clamp01(cos_theta)).powi(5)))
 }
 
 fn main() {
@@ -1291,8 +1506,9 @@ fn main() {
     let material1 = Arc::new(Lambert::new(Vec3::new(0.63, 0.065, 0.05))); // Red
     let material2 = Arc::new(Lambert::new(Vec3::new(0.14, 0.45, 0.091))); // Green
     let material3 = Arc::new(Lambert::new(Vec3::new(0.725, 0.71, 0.68))); // White
-    let material4 =
-        Arc::new(Pbr::new(Vec3::zero(), 1.0, 0.0).from_f0(Vec3::new(1.059, 0.773, 0.307))); // Gold
+    let material4 = Arc::new(
+        Pbr::new(Vec3::new(0.988, 1.0, 0.976), 0.0, 0.05).from_f0(Vec3::new(0.04, 0.04, 0.04)),
+    );
 
     let mut mesh = Mesh::from_obj(
         "stanford_dragon.obj",
@@ -1302,12 +1518,15 @@ fn main() {
     );
     mesh.build_bvh();
 
+    println!("BVH node count: {}", mesh.nodes.len());
+    println!("Mesh triangle count: {}", mesh.tris.len());
+
     let light = Quad::emissive_from_power(
         Vec3::new(0.000, 0.000, 1.523),
-        Vec3::new(0.1785, 0.000, 0.000),
-        Vec3::new(0.000, -0.1440, 0.000),
-        Vec3::new(1.0, 1.0, 1.0),
-        10.0,
+        Vec3::new(0.2231081, 0.000, 0.000),
+        Vec3::new(0.000, 0.1802027, 0.000),
+        Vec3::new(1.0, 0.85, 0.73), // ~4500k
+        8.0,
     );
 
     let quad1 = Quad::new(
@@ -1343,7 +1562,7 @@ fn main() {
 
     let mut hl = HittableList::new();
     hl.add(mesh);
-    hl.add(light);
+    hl.add(light.clone());
     hl.add(quad1);
     hl.add(quad2);
     hl.add(quad3);
@@ -1387,8 +1606,19 @@ fn main() {
                 let y = height - 1 - y_idx as u32;
 
                 for x in 0..width {
-                    let mut color =
-                        trace(x, y, width, height, &camera, &hl, 10, 5, args.samples, rng);
+                    let mut color = trace(
+                        x,
+                        y,
+                        width,
+                        height,
+                        &camera,
+                        &hl,
+                        &light,
+                        10,
+                        5,
+                        args.samples,
+                        rng,
+                    );
                     color = color.smul(2.0f32.powf(exposure));
                     let [r, g, b] = linear_to_srgb(aces_tonemapping(color));
 
