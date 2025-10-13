@@ -219,18 +219,18 @@ impl HitInfo {
 
 #[derive(Clone)]
 enum Materials {
-    Reflective(Arc<dyn Reflective>),
     Emissive(Arc<dyn Emissive>),
+    Reflective(Arc<dyn Reflective>),
+}
+
+trait Emissive: Send + Sync {
+    fn emission(&self, wo: Vec3, n: Vec3) -> Vec3;
 }
 
 trait Reflective: Send + Sync {
     fn eval_brdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> Vec3;
     fn sample_brdf(&self, wo: Vec3, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3);
     fn sample_pdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> f32;
-}
-
-trait Emissive: Send + Sync {
-    fn emission(&self, wo: Vec3, n: Vec3) -> Vec3;
 }
 
 struct Lambert {
@@ -346,15 +346,14 @@ impl Pbr {
             .add(self.base_color.smul(self.metallic))
     }
 
-    fn diffuse_tint(&self) -> Vec3 {
-        if self.metallic >= 0.9999 {
+    fn kd(&self, wi: Vec3, wo: Vec3) -> Vec3 {
+        if self.metallic > 0.9999 {
             return Vec3::zero();
         }
-
-        let f0 = self.f0();
-        let f_avg = f0.add(Vec3::one().sub(f0).smul(1.0 / 21.0));
-        let ks = f_avg.mean();
-        self.base_color.smul(1.0 - ks)
+        let h = wi.add(wo).norm();
+        let v_dot_h = wo.dot(&h).max(0.0);
+        let f = schlick_fresnel(v_dot_h, self.f0());
+        Vec3::one().sub(f).smul(1.0 - self.metallic)
     }
 
     fn ggx_ndf(n_dot_h: f32, alpha: f32) -> f32 {
@@ -469,7 +468,9 @@ impl Reflective for Pbr {
         }
 
         let spec = self.eval_spec(wi, wo, n);
-        let diff = self.diffuse_tint().smul(1.0 / PI);
+
+        let kd = self.kd(wi, wo);
+        let diff = self.base_color.mul(kd).smul(1.0 / PI);
 
         diff.add(spec)
     }
@@ -945,6 +946,37 @@ impl Mesh {
         }
     }
 
+    fn bvh_depth(&self) -> (usize, usize) {
+        if self.nodes.is_empty() {
+            return (0, 0);
+        }
+
+        fn traverse(nodes: &Vec<BvhNode>, id: i32, depth: usize) -> (usize, usize) {
+            let node = &nodes[id as usize];
+            if node.left < 0 && node.right < 0 {
+                return (depth, depth);
+            }
+
+            let mut min_d = usize::MAX;
+            let mut max_d = 0;
+
+            if node.left >= 0 {
+                let (min_l, max_l) = traverse(nodes, node.left, depth + 1);
+                min_d = min_d.min(min_l);
+                max_d = max_d.max(max_l);
+            }
+            if node.right >= 0 {
+                let (min_r, max_r) = traverse(nodes, node.right, depth + 1);
+                min_d = min_d.min(min_r);
+                max_d = max_d.max(max_r);
+            }
+
+            (min_d, max_d)
+        }
+
+        traverse(&self.nodes, (self.nodes.len() - 1) as i32, 0)
+    }
+
     fn build_bvh(&mut self) {
         if self.tris.is_empty() {
             self.indices.clear();
@@ -1254,7 +1286,9 @@ fn trace(
     spp: u32,
     rng: &mut ThreadRng,
 ) -> Vec3 {
-    let mut sum = Vec3::zero();
+    let mut sx = 0.0f64;
+    let mut sy = 0.0f64;
+    let mut sz = 0.0f64;
 
     for _ in 0..spp {
         let mut radiance = Vec3::zero();
@@ -1353,9 +1387,15 @@ fn trace(
                 }
             }
         }
-        sum = sum.add(radiance);
+        sx += radiance.x as f64;
+        sy += radiance.y as f64;
+        sz += radiance.z as f64;
     }
-    sum.smul(1.0 / spp as f32)
+    Vec3::new(
+        (sx / spp as f64) as f32,
+        (sy / spp as f64) as f32,
+        (sz / spp as f64) as f32,
+    )
 }
 
 fn linear_to_srgb(rgb: (f32, f32, f32)) -> [u8; 3] {
@@ -1492,6 +1532,7 @@ fn main() {
     let height = args.height;
 
     let exposure = args.exposure;
+    let exposure_scale = 2.0f32.powf(exposure);
 
     let camera = Camera::from_resolution(
         24.0,                         // Focal length
@@ -1518,7 +1559,10 @@ fn main() {
     );
     mesh.build_bvh();
 
+    let (min_depth, max_depth) = mesh.bvh_depth();
     println!("BVH node count: {}", mesh.nodes.len());
+    println!("BVH min depth: {}", min_depth);
+    println!("BVH max depth: {}", max_depth);
     println!("Mesh triangle count: {}", mesh.tris.len());
 
     let light = Quad::emissive_from_power(
@@ -1614,12 +1658,12 @@ fn main() {
                         &camera,
                         &hl,
                         &light,
-                        10,
-                        5,
+                        16,
+                        6,
                         args.samples,
                         rng,
                     );
-                    color = color.smul(2.0f32.powf(exposure));
+                    color = color.smul(exposure_scale);
                     let [r, g, b] = linear_to_srgb(aces_tonemapping(color));
 
                     let i = (x as usize) * 3;
