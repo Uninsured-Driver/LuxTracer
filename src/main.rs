@@ -2,6 +2,7 @@
 
 use std::{
     f32::{self, consts::PI},
+    ops::Neg,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -33,6 +34,9 @@ impl Vec3 {
     }
     fn one() -> Self {
         Self::new(1.0, 1.0, 1.0)
+    }
+    fn splat(value: f32) -> Self {
+        Self::new(value, value, value)
     }
 
     // ---------- Arithmetic ----------
@@ -97,6 +101,13 @@ impl Ray {
 
     fn at(&self, t: f32) -> Vec3 {
         self.origin.add(self.dir.smul(t))
+    }
+}
+
+impl Neg for Vec3 {
+    type Output = Self;
+    fn neg(self) -> Self::Output {
+        Self::new(-self.x, -self.y, -self.z)
     }
 }
 
@@ -221,6 +232,7 @@ impl HitInfo {
 enum Materials {
     Emissive(Arc<dyn Emissive>),
     Reflective(Arc<dyn Reflective>),
+    Refractive(Arc<dyn Refractive>),
 }
 
 trait Emissive: Send + Sync {
@@ -231,6 +243,19 @@ trait Reflective: Send + Sync {
     fn eval_brdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> Vec3;
     fn sample_brdf(&self, wo: Vec3, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3);
     fn sample_pdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> f32;
+}
+
+trait Refractive: Send + Sync {
+    fn sample(
+        &self,
+        wo: Vec3,
+        n: Vec3,
+        front_face: bool,
+        ior_i: f32,
+        ior_t: f32,
+        rng: &mut ThreadRng,
+    ) -> (Vec3, f32, Vec3, bool);
+    fn ior(&self) -> f32;
 }
 
 struct Lambert {
@@ -303,6 +328,67 @@ struct LightSample {
 trait Light: Send + Sync {
     fn sample(&self, x: Vec3, n: Vec3, rng: &mut ThreadRng) -> LightSample;
     fn pdf(&self, x: Vec3, wi: Vec3) -> f32;
+}
+
+struct Medium {
+    ior: f32,
+}
+
+impl Medium {
+    fn new(ior: f32) -> Self {
+        Self { ior }
+    }
+}
+
+struct Glass {
+    ior: f32,
+}
+
+impl Glass {
+    fn new(ior: f32) -> Self {
+        Self { ior }
+    }
+}
+
+impl Refractive for Glass {
+    fn sample(
+        &self,
+        wo: Vec3,
+        n: Vec3,
+        _front_face: bool,
+        ior_i: f32,
+        ior_t: f32,
+        rng: &mut ThreadRng,
+    ) -> (Vec3, f32, Vec3, bool) {
+        let eta = ior_i / ior_t;
+
+        let cos_i = n.dot(&wo).abs().max(1e-8);
+        let f0 = f0_from_ior(ior_i, ior_t);
+        let fresnel = f0 + (1.0 - f0) * (1.0 - cos_i).powi(5);
+
+        if let Some(refracted) = refract(-wo, n, eta) {
+            if rng.random::<f32>() < fresnel {
+                let reflected = reflect(-wo, n).norm();
+                return (reflected, fresnel, Vec3::splat(fresnel), false);
+            } else {
+                let cos_t = n.dot(&refracted).abs().max(1e-8);
+                let eta_scale = 1.0 / (eta * eta) * (cos_t / cos_i);
+                return (
+                    refracted,
+                    1.0 - fresnel,
+                    Vec3::splat((1.0 - fresnel) * eta_scale),
+                    true,
+                );
+            }
+        } else {
+            let reflected = reflect(-wo, n).norm();
+            return (reflected, 1.0, Vec3::one(), false);
+        }
+    }
+
+    fn ior(&self) -> f32 {
+        self.ior
+    }
 }
 
 struct Pbr {
@@ -1286,11 +1372,9 @@ fn trace(
     spp: u32,
     rng: &mut ThreadRng,
 ) -> Vec3 {
-    let mut sx = 0.0f64;
-    let mut sy = 0.0f64;
-    let mut sz = 0.0f64;
+    let mut pixel = Vec3::zero();
 
-    for _ in 0..spp {
+    for sample in 0..spp {
         let mut radiance = Vec3::zero();
         let mut throughput = Vec3::one();
 
@@ -1301,6 +1385,8 @@ fn trace(
         let v = (y as f32 + jy) / height as f32;
 
         let mut ray = camera.get_ray(u, v);
+
+        let mut medium_stack = vec![Medium::new(1.0)];
 
         for i in 0..max_depth {
             let Some(hit) = world.hit(&ray, 0.0, f32::INFINITY) else {
@@ -1385,17 +1471,47 @@ fn trace(
 
                     ray = Ray::new(offset_origin, wi);
                 }
+
+                Materials::Refractive(refractive) => {
+                    let ior_i = medium_stack.last().unwrap().ior;
+                    let ior_t = if hit.front_face {
+                        refractive.ior()
+                    } else if medium_stack.len() > 1 {
+                        medium_stack[medium_stack.len() - 2].ior
+                    } else {
+                        1.0
+                    };
+
+                    let (wi, pdf, weight, transmitted) =
+                        refractive.sample(wo, n, hit.front_face, ior_i, ior_t, rng);
+
+                    if transmitted {
+                        if hit.front_face {
+                            medium_stack.push(Medium::new(refractive.ior()));
+                        } else if medium_stack.len() > 1 {
+                            medium_stack.pop();
+                        }
+                    }
+
+                    throughput = throughput.mul(weight).smul(1.0 / pdf);
+
+                    if i >= rr_start {
+                        let mut q = throughput.max_comp();
+                        q = q.clamp(0.05, 0.95);
+                        if rng.random::<f32>() > q {
+                            break;
+                        }
+                        throughput = throughput.smul(1.0 / q);
+                    }
+
+                    let offset_origin = offset_ray_origin(p, n, wi);
+                    ray = Ray::new(offset_origin, wi);
+                }
             }
         }
-        sx += radiance.x as f64;
-        sy += radiance.y as f64;
-        sz += radiance.z as f64;
+        pixel = pixel.add(radiance.sub(pixel).smul(1.0 / (sample as f32 + 1.0)))
     }
-    Vec3::new(
-        (sx / spp as f64) as f32,
-        (sy / spp as f64) as f32,
-        (sz / spp as f64) as f32,
-    )
+    pixel
 }
 
 fn linear_to_srgb(rgb: (f32, f32, f32)) -> [u8; 3] {
@@ -1525,6 +1641,74 @@ fn schlick_fresnel(cos_theta: f32, f0: Vec3) -> Vec3 {
     f0.add(Vec3::one().sub(f0).smul((1.0 - clamp01(cos_theta)).powi(5)))
 }
 
+fn refract(v: Vec3, n: Vec3, eta: f32) -> Option<Vec3> {
+    let n = n.norm();
+    let cos_i = (v.smul(-1.0)).dot(&n).clamp(-1.0, 1.0);
+
+    let sin2_t = eta * eta * (1.0 - cos_i * cos_i);
+    if sin2_t > 1.0 {
+        return None;
+    }
+
+    let cos_t = (1.0 - sin2_t).sqrt();
+
+    let refracted = v.smul(eta).add(n.smul(eta * cos_i - cos_t));
+    Some(refracted.norm())
+}
+
+fn f0_from_ior(ior_i: f32, ior_t: f32) -> f32 {
+    let r0 = (ior_i - ior_t) / (ior_i + ior_t);
+    r0 * r0
+}
+
+fn reflect(v: Vec3, n: Vec3) -> Vec3 {
+    v.sub(n.smul(2.0 * v.dot(&n)))
+}
+
+fn srgb_to_linear_u8(r: u32, g: u32, b: u32) -> Vec3 {
+    fn convert(c: f32) -> f32 {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    Vec3::new(
+        convert(r as f32 / 255.0),
+        convert(g as f32 / 255.0),
+        convert(b as f32 / 255.0),
+    )
+}
+
+fn blackbody(kelvin: f64) -> Vec3 {
+    let t = kelvin.clamp(1667.0, 25000.0);
+
+    let x = if t <= 4000.0 {
+        (-0.2661239e9 / (t * t * t)) - (0.2343580e6 / (t * t)) + (0.8776956e3 / t) + 0.179910
+    } else {
+        (-3.0258469e9 / (t * t * t)) + (2.1070379e6 / (t * t)) + (0.2226347e3 / t) + 0.240390
+    };
+
+    let y = if t <= 2222.0 {
+        -1.1063814 * x * x * x - 1.3481102 * x * x + 2.18555832 * x - 0.20219683
+    } else if t <= 4000.0 {
+        -0.9549476 * x * x * x - 1.37418593 * x * x + 2.09137015 * x - 0.16748867
+    } else {
+        3.0817580 * x * x * x - 5.87338670 * x * x + 3.75112997 * x - 0.37001483
+    };
+
+    let y_lum = 1.0;
+    let x_tristim = (x / y) * y_lum;
+    let z_tristim = ((1.0 - x - y) / y) * y_lum;
+
+    let r = 3.2406 * x_tristim - 1.5372 * y_lum - 0.4986 * z_tristim;
+    let g = -0.9689 * x_tristim + 1.8758 * y_lum + 0.0415 * z_tristim;
+    let b = 0.0557 * x_tristim - 0.2040 * y_lum + 1.0570 * z_tristim;
+
+    let max = r.max(g).max(b);
+    Vec3::new((r / max) as f32, (g / max) as f32, (b / max) as f32)
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -1544,16 +1728,15 @@ fn main() {
         Vec3::new(0.0, 0.0, 1.0),     // Up (0.0, 0.0, 1.0) for Z-up
     );
 
-    let material1 = Arc::new(Lambert::new(Vec3::new(0.63, 0.065, 0.05))); // Red
-    let material2 = Arc::new(Lambert::new(Vec3::new(0.14, 0.45, 0.091))); // Green
+    let material1 = Arc::new(Lambert::new(srgb_to_linear_u8(222, 50, 50))); // Red
+    let material2 = Arc::new(Lambert::new(srgb_to_linear_u8(94, 199, 85))); // Green
     let material3 = Arc::new(Lambert::new(Vec3::new(0.725, 0.71, 0.68))); // White
-    let material4 = Arc::new(
-        Pbr::new(Vec3::new(0.988, 1.0, 0.976), 0.0, 0.05).from_f0(Vec3::new(0.04, 0.04, 0.04)),
-    );
+    let material4 = Arc::new(Lambert::new(srgb_to_linear_u8(101, 146, 237))); // Blue
+    let material5 = Arc::new(Glass::new(1.6));
 
     let mut mesh = Mesh::from_obj(
-        "stanford_dragon.obj",
-        Materials::Reflective(material4.clone()),
+        "stanford_dragon_remeshed.obj",
+        Materials::Refractive(material5.clone()),
         Vec3::new(-0.05, 0.0, 0.395),
         Vec3::new(0.75, 0.75, 0.75),
     );
@@ -1567,11 +1750,17 @@ fn main() {
 
     let light = Quad::emissive_from_power(
         Vec3::new(0.000, 0.000, 1.523),
-        Vec3::new(0.2231081, 0.000, 0.000),
-        Vec3::new(0.000, 0.1802027, 0.000),
-        Vec3::new(1.0, 0.85, 0.73), // ~4500k
-        8.0,
+        Vec3::new(0.2231081 / 1.5, 0.000, 0.000),
+        Vec3::new(0.000, 0.1802027 / 1.5, 0.000),
+        blackbody(4500.0),
+        7.0,
     );
+
+    // let sphere1 = Sphere::new(
+    //     Vec3::new(0.0, 0.0, 0.6),
+    //     0.3,
+    //     Materials::Refractive(material5.clone()),
+    // );
 
     let quad1 = Quad::new(
         Vec3::new(0.0, 0.0, 0.0),
@@ -1595,7 +1784,7 @@ fn main() {
         Vec3::new(0.000, 0.762, 0.762),
         Vec3::new(0.762, 0.000, 0.000),
         Vec3::new(0.000, 0.000, 0.762),
-        Materials::Reflective(material3.clone()),
+        Materials::Reflective(material4.clone()),
     );
     let quad5 = Quad::new(
         Vec3::new(0.000, 0.000, 1.524),
@@ -1606,6 +1795,7 @@ fn main() {
 
     let mut hl = HittableList::new();
     hl.add(mesh);
+    // hl.add(sphere1);
     hl.add(light.clone());
     hl.add(quad1);
     hl.add(quad2);
