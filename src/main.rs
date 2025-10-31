@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
+use lux_tracer::sobol::{SobolLayout, SobolSampler, SobolTable};
 use std::{
-    f32::{self, consts::PI},
+    f32::consts::PI,
     ops::Neg,
     sync::{
         Arc,
@@ -14,7 +15,6 @@ use std::{
 use clap::{ArgAction, Parser};
 use image::RgbImage;
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::prelude::*;
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -127,7 +127,7 @@ impl Camera {
         let viewport_h = 2.0 * h;
         let viewport_w = aspect * viewport_h;
 
-        let w = (look_from.sub(look_at)).norm();
+        let w = look_from.sub(look_at).norm();
         let u = vup.cross(w).norm();
         let v = w.cross(u);
 
@@ -241,19 +241,21 @@ trait Emissive: Send + Sync {
 
 trait Reflective: Send + Sync {
     fn eval_brdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> Vec3;
-    fn sample_brdf(&self, wo: Vec3, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3);
+
+    fn sample_brdf_uv(&self, wo: Vec3, n: Vec3, u1: f32, u2: f32, u_lobe: f32)
+    -> (Vec3, f32, Vec3);
     fn sample_pdf(&self, wi: Vec3, wo: Vec3, n: Vec3) -> f32;
 }
 
 trait Refractive: Send + Sync {
-    fn sample(
+    fn sample_uv(
         &self,
         wo: Vec3,
         n: Vec3,
         front_face: bool,
         ior_i: f32,
         ior_t: f32,
-        rng: &mut ThreadRng,
+        u_lobe: f32,
     ) -> (Vec3, f32, Vec3, bool);
     fn ior(&self) -> f32;
 }
@@ -273,8 +275,15 @@ impl Reflective for Lambert {
         self.albedo.smul(1.0 / PI)
     }
 
-    fn sample_brdf(&self, _wo: Vec3, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3) {
-        let (sample, pdf) = cosine_weighted_sampling(rng);
+    fn sample_brdf_uv(
+        &self,
+        _wo: Vec3,
+        n: Vec3,
+        u1: f32,
+        u2: f32,
+        _u_lobe: f32,
+    ) -> (Vec3, f32, Vec3) {
+        let (sample, pdf) = cosine_from_uv(u1, u2);
         let (t, b) = build_onb(n);
         let wi = local_to_world(sample, t, b, n);
 
@@ -326,7 +335,7 @@ struct LightSample {
 }
 
 trait Light: Send + Sync {
-    fn sample(&self, x: Vec3, n: Vec3, rng: &mut ThreadRng) -> LightSample;
+    fn sample_uv(&self, x: Vec3, n: Vec3, u: f32, v: f32) -> LightSample;
     fn pdf(&self, x: Vec3, wi: Vec3) -> f32;
 }
 
@@ -351,14 +360,14 @@ impl Glass {
 }
 
 impl Refractive for Glass {
-    fn sample(
+    fn sample_uv(
         &self,
         wo: Vec3,
         n: Vec3,
         _front_face: bool,
         ior_i: f32,
         ior_t: f32,
-        rng: &mut ThreadRng,
+        u_lobe: f32,
     ) -> (Vec3, f32, Vec3, bool) {
         let eta = ior_i / ior_t;
 
@@ -367,22 +376,22 @@ impl Refractive for Glass {
         let fresnel = f0 + (1.0 - f0) * (1.0 - cos_i).powi(5);
 
         if let Some(refracted) = refract(-wo, n, eta) {
-            if rng.random::<f32>() < fresnel {
+            if u_lobe < fresnel {
                 let reflected = reflect(-wo, n).norm();
-                return (reflected, fresnel, Vec3::splat(fresnel), false);
+                (reflected, fresnel, Vec3::splat(fresnel), false)
             } else {
                 let cos_t = n.dot(&refracted).abs().max(1e-8);
                 let eta_scale = 1.0 / (eta * eta) * (cos_t / cos_i);
-                return (
+                (
                     refracted,
                     1.0 - fresnel,
                     Vec3::splat((1.0 - fresnel) * eta_scale),
                     true,
-                );
+                )
             }
         } else {
             let reflected = reflect(-wo, n).norm();
-            return (reflected, 1.0, Vec3::one(), false);
+            (reflected, 1.0, Vec3::one(), false)
         }
     }
 
@@ -407,18 +416,17 @@ impl Pbr {
             f0: None,
         }
     }
-    fn from_f0(mut self, f0: Vec3) -> Self {
-        self.f0 = Some(f0);
-        self
+    fn from_f0(base_color: Vec3, metallic: f32, roughness: f32, f0: Vec3) -> Self {
+        Self {
+            base_color,
+            metallic: metallic.clamp(0.0, 1.0),
+            alpha: roughness * roughness,
+            f0: Some(f0),
+        }
     }
-
     #[inline]
     fn safe_rcp(x: f32) -> f32 {
         1.0 / x.max(1e-8)
-    }
-    #[inline]
-    fn reflect(v: Vec3, n: Vec3) -> Vec3 {
-        v.sub(n.smul(2.0 * v.dot(&n)))
     }
 
     fn f0(&self) -> Vec3 {
@@ -474,7 +482,7 @@ impl Pbr {
         Self::smith_g1_exact(n_dot_l, alpha) * Self::smith_g1_exact(n_dot_v, alpha)
     }
 
-    fn sample_ggx_vndf_local(wo_local: Vec3, alpha: f32, rng: &mut ThreadRng) -> Vec3 {
+    fn sample_ggx_vndf_local_uv(wo_local: Vec3, alpha: f32, u1: f32, u2: f32) -> Vec3 {
         let vh = Vec3::new(alpha * wo_local.x, alpha * wo_local.y, wo_local.z).norm();
 
         let lensq = vh.x * vh.x + vh.y * vh.y;
@@ -486,8 +494,6 @@ impl Pbr {
             (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0))
         };
 
-        let u1 = rng.random::<f32>();
-        let u2 = rng.random::<f32>();
         let r = u1.sqrt();
         let phi = 2.0 * PI * u2;
         let t1c = r * phi.cos();
@@ -527,7 +533,7 @@ impl Pbr {
             return Vec3::zero();
         }
 
-        let h = (wi.add(wo)).norm();
+        let h = wi.add(wo).norm();
         let n_dot_h = n.dot(&h).max(0.0);
         let v_dot_h = wo.dot(&h).max(0.0);
 
@@ -561,14 +567,21 @@ impl Reflective for Pbr {
         diff.add(spec)
     }
 
-    fn sample_brdf(&self, wo: Vec3, n: Vec3, rng: &mut ThreadRng) -> (Vec3, f32, Vec3) {
+    fn sample_brdf_uv(
+        &self,
+        wo: Vec3,
+        n: Vec3,
+        u1: f32,
+        u2: f32,
+        u_lobe: f32,
+    ) -> (Vec3, f32, Vec3) {
         let n_dot_v = n.dot(&wo).max(0.0);
         if n_dot_v <= 0.0 {
             return (Vec3::zero(), 1.0, Vec3::zero());
         }
 
         if self.alpha < 1e-5 {
-            let wi = Self::reflect(wo.smul(-1.0), n);
+            let wi = reflect(wo.smul(-1.0), n);
             if n.dot(&wi) <= 0.0 {
                 return (Vec3::zero(), 1.0, Vec3::zero());
             }
@@ -592,10 +605,10 @@ impl Reflective for Pbr {
             (c / PI).max(1e-8)
         };
 
-        if rng.random::<f32>() < ks {
-            let h_local = Self::sample_ggx_vndf_local(wo_local, self.alpha, rng);
+        if u_lobe < ks {
+            let h_local = Self::sample_ggx_vndf_local_uv(wo_local, self.alpha, u1, u2);
             let h = local_to_world(h_local, t, b, n);
-            let wi = Self::reflect(wo.smul(-1.0), h);
+            let wi = reflect(wo.smul(-1.0), h);
 
             if n.dot(&wi) <= 0.0 {
                 return (Vec3::zero(), 1.0, Vec3::zero());
@@ -608,7 +621,7 @@ impl Reflective for Pbr {
             let brdf = self.eval_brdf(wi, wo, n);
             (wi, pdf, brdf)
         } else {
-            let (samp, _pdf_local) = cosine_weighted_sampling(rng);
+            let (samp, _pdf_local) = cosine_from_uv(u1, u2);
             let wi = local_to_world(samp, t, b, n);
             if n.dot(&wi) <= 0.0 {
                 return (Vec3::zero(), 1.0, Vec3::zero());
@@ -729,16 +742,6 @@ impl Quad {
         self.ux.cross(self.vy).norm()
     }
 
-    #[inline]
-    fn sample_point(&self, rng: &mut ThreadRng) -> (Vec3, f32) {
-        let u = rng.random::<f32>() * 2.0 - 1.0;
-        let v = rng.random::<f32>() * 2.0 - 1.0;
-        let y = self.center.add(self.ux.smul(u)).add(self.vy.smul(v));
-        let pdf_a = 1.0 / self.area().max(1e-8);
-
-        (y, pdf_a)
-    }
-
     fn intersect_from(&self, x: Vec3, wi: Vec3) -> Option<(f32, Vec3)> {
         let n = self.normal();
         let denom = n.dot(&wi);
@@ -837,10 +840,12 @@ impl Hittable for Quad {
 }
 
 impl Light for Quad {
-    fn sample(&self, x: Vec3, _n: Vec3, rng: &mut ThreadRng) -> LightSample {
+    fn sample_uv(&self, x: Vec3, _n: Vec3, u: f32, v: f32) -> LightSample {
         let light_normal = self.normal();
 
-        let (y, pdf_a) = self.sample_point(rng);
+        let su = 2.0 * u - 1.0;
+        let sv = 2.0 * v - 1.0;
+        let y = self.center.add(self.ux.smul(su)).add(self.vy.smul(sv));
 
         let to_y = y.sub(x);
         let dist2 = to_y.dot(&to_y).max(1e-12);
@@ -864,6 +869,7 @@ impl Light for Quad {
             };
         }
 
+        let pdf_a = (1.0 / self.area()).max(1e-8);
         let pdf = ((dist2 / cos_l) * pdf_a).max(1e-8);
         let radiance = if let Some(emissive) = self.is_emissive() {
             emissive.emission(wi.smul(-1.0), light_normal)
@@ -880,6 +886,7 @@ impl Light for Quad {
             pdf,
         }
     }
+
     fn pdf(&self, x: Vec3, wi: Vec3) -> f32 {
         if let Some((t, light_normal)) = self.intersect_from(x, wi) {
             let cos_l = light_normal.dot(&wi.smul(-1.0)).max(0.0);
@@ -1297,17 +1304,13 @@ fn world_to_local(v: Vec3, t: Vec3, b: Vec3, n: Vec3) -> Vec3 {
     Vec3::new(v.dot(&t), v.dot(&b), v.dot(&n))
 }
 
-fn cosine_weighted_sampling<R: Rng + ?Sized>(rng: &mut R) -> (Vec3, f32) {
-    let u1 = rng.random::<f32>();
-    let u2 = rng.random::<f32>();
-
+#[inline]
+fn cosine_from_uv(u1: f32, u2: f32) -> (Vec3, f32) {
     let r = u1.sqrt();
     let phi = 2.0 * PI * u2;
-
     let x = r * phi.cos();
     let y = r * phi.sin();
     let z = (1.0 - u1).max(0.0).sqrt();
-
     let pdf = (z / PI).max(1e-8);
     (Vec3::new(x, y, z), pdf)
 }
@@ -1367,10 +1370,10 @@ fn trace(
     camera: &Camera,
     world: &dyn Hittable,
     light: &dyn Light,
-    max_depth: u32,
-    rr_start: u32,
+    max_depth: usize,
+    rr_start: usize,
     spp: u32,
-    rng: &mut ThreadRng,
+    sampler: &mut SobolSampler,
 ) -> Vec3 {
     let mut pixel = Vec3::zero();
 
@@ -1378,8 +1381,7 @@ fn trace(
         let mut radiance = Vec3::zero();
         let mut throughput = Vec3::one();
 
-        let jx = rng.random::<f32>();
-        let jy = rng.random::<f32>();
+        let (jx, jy) = sampler.cam_jitter();
 
         let u = (x as f32 + jx) / width as f32;
         let v = (y as f32 + jy) / height as f32;
@@ -1406,7 +1408,8 @@ fn trace(
 
                 Materials::Reflective(reflective) => {
                     // ---------- Next-Event Estimation ----------
-                    let ls = light.sample(p, n, rng);
+                    let (u, v) = sampler.nee(i);
+                    let ls = light.sample_uv(p, n, u, v);
                     if ls.pdf > 1e-8 {
                         let cos_i = n.dot(&ls.wi).max(0.0);
                         if cos_i > 0.0 && ls.radiance.max_comp() > 0.0 {
@@ -1416,7 +1419,7 @@ fn trace(
                             let int_scale = 256;
                             let bits = ls.dist.to_bits();
                             let shifted = bits - int_scale;
-                            let t_max = f32::from_bits(shifted as u32);
+                            let t_max = f32::from_bits(shifted);
 
                             let visible = world.hit(&shadow_ray, 0.0, t_max).is_none();
 
@@ -1432,7 +1435,9 @@ fn trace(
                     }
 
                     // ---------- BRDF Sampling ----------
-                    let (wi, p_brdf, brdf) = reflective.sample_brdf(wo, n, rng);
+                    let (u1, u2) = sampler.bsdf(i);
+                    let u_lobe = sampler.lobe(i);
+                    let (wi, p_brdf, brdf) = reflective.sample_brdf_uv(wo, n, u1, u2, u_lobe);
                     if p_brdf <= 1e-8 {
                         break;
                     }
@@ -1461,7 +1466,7 @@ fn trace(
                     if i >= rr_start {
                         let mut q = throughput.max_comp();
                         q = q.clamp(0.05, 0.95);
-                        if rng.random::<f32>() > q {
+                        if sampler.rr(i) > q {
                             break;
                         }
                         throughput = throughput.smul(1.0 / q);
@@ -1482,8 +1487,9 @@ fn trace(
                         1.0
                     };
 
+                    let u_lobe = sampler.lobe(i);
                     let (wi, pdf, weight, transmitted) =
-                        refractive.sample(wo, n, hit.front_face, ior_i, ior_t, rng);
+                        refractive.sample_uv(wo, n, hit.front_face, ior_i, ior_t, u_lobe);
 
                     if transmitted {
                         if hit.front_face {
@@ -1498,7 +1504,7 @@ fn trace(
                     if i >= rr_start {
                         let mut q = throughput.max_comp();
                         q = q.clamp(0.05, 0.95);
-                        if rng.random::<f32>() > q {
+                        if sampler.rr(i) > q {
                             break;
                         }
                         throughput = throughput.smul(1.0 / q);
@@ -1509,7 +1515,8 @@ fn trace(
                 }
             }
         }
-        pixel = pixel.add(radiance.sub(pixel).smul(1.0 / (sample as f32 + 1.0)))
+        pixel = pixel.add(radiance.sub(pixel).smul(1.0 / (sample as f32 + 1.0)));
+        sampler.next_sample();
     }
     pixel
 }
@@ -1546,6 +1553,10 @@ struct Args {
     /// Exposure setting
     #[arg(short = 'e', long = "exposure", default_value_t = 0.0)]
     exposure: f32,
+
+    /// Max ray depth
+    #[arg(short = 'd', long = "depth", default_value_t = 16)]
+    max_depth: usize,
 
     /// Print help
     #[arg(long = "help", action = ArgAction::Help)]
@@ -1633,17 +1644,17 @@ impl Aabb {
     }
 }
 
-fn clamp01(x: f32) -> f32 {
-    x.max(0.0).min(1.0)
-}
-
 fn schlick_fresnel(cos_theta: f32, f0: Vec3) -> Vec3 {
-    f0.add(Vec3::one().sub(f0).smul((1.0 - clamp01(cos_theta)).powi(5)))
+    f0.add(
+        Vec3::one()
+            .sub(f0)
+            .smul((1.0 - cos_theta.clamp(0.0, 1.0)).powi(5)),
+    )
 }
 
 fn refract(v: Vec3, n: Vec3, eta: f32) -> Option<Vec3> {
     let n = n.norm();
-    let cos_i = (v.smul(-1.0)).dot(&n).clamp(-1.0, 1.0);
+    let cos_i = v.smul(-1.0).dot(&n).clamp(-1.0, 1.0);
 
     let sin2_t = eta * eta * (1.0 - cos_i * cos_i);
     if sin2_t > 1.0 {
@@ -1718,6 +1729,9 @@ fn main() {
     let exposure = args.exposure;
     let exposure_scale = 2.0f32.powf(exposure);
 
+    let max_depth = args.max_depth;
+    let spp = args.samples;
+
     let camera = Camera::from_resolution(
         24.0,                         // Focal length
         24.0,                         // Sensor size
@@ -1727,6 +1741,9 @@ fn main() {
         Vec3::new(0.0, 0.0, 0.76),    // Look at
         Vec3::new(0.0, 0.0, 1.0),     // Up (0.0, 0.0, 1.0) for Z-up
     );
+
+    let layout = SobolLayout::new(max_depth);
+    let sobol_table = Arc::new(SobolTable::new(layout.total_dims(), spp as usize));
 
     let material1 = Arc::new(Lambert::new(srgb_to_linear_u8(222, 50, 50))); // Red
     let material2 = Arc::new(Lambert::new(srgb_to_linear_u8(94, 199, 85))); // Green
@@ -1742,10 +1759,10 @@ fn main() {
     );
     mesh.build_bvh();
 
-    let (min_depth, max_depth) = mesh.bvh_depth();
+    let (bvh_min_depth, bvh_max_depth) = mesh.bvh_depth();
     println!("BVH node count: {}", mesh.nodes.len());
-    println!("BVH min depth: {}", min_depth);
-    println!("BVH max depth: {}", max_depth);
+    println!("BVH min depth: {}", bvh_min_depth);
+    println!("BVH max depth: {}", bvh_max_depth);
     println!("Mesh triangle count: {}", mesh.tris.len());
 
     let light = Quad::emissive_from_power(
@@ -1831,41 +1848,50 @@ fn main() {
     let row_stride = width as usize * 3;
     let mut pixels = vec![0u8; width as usize * height as usize * 3];
 
-    pixels
-        .par_chunks_mut(row_stride)
-        .enumerate()
-        .map_init(
-            || (rand::rng(), Arc::clone(&rayon_counter)),
-            |(rng, counter), (y_idx, row)| {
-                let y = height - 1 - y_idx as u32;
+    let seed = 0;
 
-                for x in 0..width {
-                    let mut color = trace(
-                        x,
-                        y,
-                        width,
-                        height,
-                        &camera,
-                        &hl,
-                        &light,
-                        16,
-                        6,
-                        args.samples,
-                        rng,
-                    );
-                    color = color.smul(exposure_scale);
-                    let [r, g, b] = linear_to_srgb(aces_tonemapping(color));
+    pixels.par_chunks_mut(row_stride).enumerate().for_each_init(
+        || (Arc::clone(&sobol_table), Arc::clone(&rayon_counter)),
+        |(sobol_table, counter), (y_idx, row)| {
+            let y = height - 1 - y_idx as u32;
 
-                    let i = (x as usize) * 3;
-                    row[i] = r;
-                    row[i + 1] = g;
-                    row[i + 2] = b;
+            for x in 0..width {
+                let key = {
+                    // SplitMix64
+                    let mut z = ((x as u64) << 32) | (y as u64) ^ seed;
+                    z ^= z >> 30;
+                    z = z.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    z ^= z >> 27;
+                    z = z.wrapping_mul(0x94d0_49bb_1331_11eb);
+                    z ^= z >> 31;
+                    (z ^ (z >> 32)) as u32
+                };
+                let mut sampler = SobolSampler::new(key, layout, sobol_table);
+                let mut color = trace(
+                    x,
+                    y,
+                    width,
+                    height,
+                    &camera,
+                    &hl,
+                    &light,
+                    max_depth,
+                    6,
+                    spp,
+                    &mut sampler,
+                );
+                color = color.smul(exposure_scale);
+                let [r, g, b] = linear_to_srgb(aces_tonemapping(color));
 
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-            },
-        )
-        .for_each(drop);
+                let i = (x as usize) * 3;
+                row[i] = r;
+                row[i + 1] = g;
+                row[i + 2] = b;
+
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+    );
     is_done.store(true, Ordering::Relaxed);
     pb_handle.join().unwrap();
 
